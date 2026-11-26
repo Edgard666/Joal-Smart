@@ -1,5 +1,11 @@
 # Journal des versions
 
+## v1.31.1 · Build GitHub corrigé
+
+- **Correction du build** : les tests navigateur utilisaient le Chrome installé sur le serveur GitHub, d'une autre version que celle attendue par Playwright, et échouaient. Le build installe maintenant le Chromium exact de Playwright, comme en développement.
+- L'étape des tests navigateur lance tous les tests et nomme ceux qui échouent dans les annotations, avec la fin de leur journal, au lieu de s'arrêter au premier.
+- Actions GitHub mises à jour vers leurs versions Node 24 (checkout v7.0.1, setup-python v7.1.0, login-action v4.8.0), toujours épinglées par empreinte : fin de l'avertissement « Node.js 20 is deprecated ».
+
 ## v1.31.0 · Alertes sur le téléphone, statistiques par tracker, sécurité
 
 - **Alertes sur le téléphone** (Paramètres) : les alertes du contrôleur (session JOAL arrêtée, qBittorrent injoignable, rétablissements, mise à jour installée) sont envoyées vers ntfy, Gotify ou Discord, au choix « problèmes seulement » ou « tout ». Bouton d'alerte de test. Le jeton reste dans `/data/alerts.json` (droits 0600), n'est jamais renvoyé à l'interface ni inclus dans les sauvegardes.

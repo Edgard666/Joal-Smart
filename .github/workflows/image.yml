@@ -34,14 +34,14 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/joal-smart-controller
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1 (Node 24)
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0 (Node 24)
         with:
           python-version: '3.12'
 
       - name: Connexion à ghcr.io
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0 (Node 24)
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -77,17 +77,32 @@ jobs:
           for file in app/static/*.js; do node --check "$file"; done
           node tests/test_table_sort.cjs
 
-      - name: Tests navigateur (Chrome)
+      - name: Tests navigateur (Chromium)
         if: steps.published.outputs.changed == 'true'
-        env:
-          CHROMIUM: /usr/bin/google-chrome
         run: |
+          # Le Chromium exact de cette version de Playwright (le Chrome du serveur GitHub n'est
+          # pas forcément compatible), comme pour les tests lancés en développement.
           python3 -m pip install --quiet playwright==1.63.0
+          python3 -m playwright install --with-deps chromium
+          export CHROMIUM="$(python3 -c 'from playwright.sync_api import sync_playwright as s; p = s().start(); print(p.chromium.executable_path); p.stop()')"
+          "$CHROMIUM" --version
+          failed=""
           for test in tests/browser_*.py; do
             echo "::group::$test"
-            timeout 300 python3 "$test"
-            echo "::endgroup::"
+            if ! timeout 300 python3 "$test" > test.log 2>&1; then
+              failed="$failed $test"
+              echo "::endgroup::"
+              echo "::error title=Test navigateur en échec::$test"
+              grep -v '^127.0.0.1' test.log | tail -n 40
+            else
+              tail -n 1 test.log
+              echo "::endgroup::"
+            fi
           done
+          if [ -n "$failed" ]; then
+            echo "Tests navigateur en échec :$failed"
+            exit 1
+          fi
 
       - name: Construction
         if: steps.published.outputs.changed == 'true'
