@@ -26,6 +26,8 @@ COPY clients/ /opt/joal/clients/
 WORKDIR /app
 COPY app/ /app/
 COPY config.example.json /app/config.example.json
+# Journal des versions, pour la fenêtre « Nouveautés » (v1.31).
+COPY CHANGELOG.md /app/CHANGELOG.md
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # Tolère une extraction Windows (CRLF, bit exécutable perdu).
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod 0755 /usr/local/bin/docker-entrypoint.sh

@@ -9,5 +9,6 @@
 !clients/
 !clients/*.client
 !clients/LICENSE-JOAL
+!CHANGELOG.md
 **/__pycache__/
 **/*.pyc

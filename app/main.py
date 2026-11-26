@@ -6,7 +6,10 @@ Requires users to explicitly opt out of dryRun to enable JOAL tracker announceme
 import sys
 import sqlite3
 import qbit_settings
+import alerts
+import changelog
 import client_identity
+import tracker_stats
 import interface_design
 import upload_history
 import import_watch
@@ -92,6 +95,10 @@ def _joal_java_opts(payload_bytes=0):
 
 
 JOAL_JAVA_OPTS = _joal_java_opts()
+# Journal des versions : /app/CHANGELOG.md dans l'image, à la racine du dépôt en développement.
+CHANGELOG_PATH = next((p for p in (Path(__file__).with_name('CHANGELOG.md'),
+                                   Path(__file__).resolve().parents[1] / 'CHANGELOG.md') if p.is_file()),
+                      Path(__file__).with_name('CHANGELOG.md'))
 # JOAL version built into the image (set by the Dockerfile); shown in the footer and /api/health.
 JOAL_VERSION = (re.sub(r'[^0-9A-Za-z.+-]', '', os.environ.get('JOAL_VERSION', '')) or 'inconnue')[:40]
 PORT = int(os.environ.get("PORT", "8788"))
@@ -115,6 +122,8 @@ SWARM_MONITOR = None
 HANDOFF_LEDGER = None
 DIAGNOSTICS = None
 NOTIFICATIONS = None
+ALERTS = None              # alerts.Dispatcher, external delivery (v1.31)
+STATS = None               # tracker_stats.TrackerStats (v1.31)
 SOLO_LIBRARY = None
 SOLO_REVISION = 0
 SOLO_EDIT_LOCK = threading.RLock()
@@ -186,6 +195,37 @@ def write_config(conf):
         except OSError:
             pass
         raise
+
+
+ALERT_TITLES = {'error': 'JOAL Smart : problème', 'success': 'JOAL Smart : rétabli', 'info': 'JOAL Smart'}
+
+
+def forward_alert(item):
+    """NotificationCenter listener: hand the alert to the external dispatcher."""
+    if ALERTS is not None:
+        ALERTS.submit(ALERT_TITLES.get(item.get('level'), 'JOAL Smart'), item.get('message', ''), item.get('level'))
+
+
+def announce_new_version():
+    """After an update (v1.31): one notification, also sent externally with level « all »."""
+    path = DATA / 'last-version.json'
+    try:
+        previous = json.loads(path.read_text(encoding='utf-8')).get('version')
+    except (OSError, ValueError, AttributeError):
+        previous = None
+    if previous == APP_VERSION:
+        return
+    try:
+        tmp = path.with_name('last-version.tmp')
+        tmp.write_text(json.dumps({'version': APP_VERSION}), encoding='utf-8')
+        tmp.replace(path)
+    except OSError:
+        return
+    if previous and NOTIFICATIONS is not None:
+        try:
+            NOTIFICATIONS.post('update', 'info', f'Mis à jour : v{previous} → v{APP_VERSION} (JOAL {JOAL_VERSION})')
+        except (OSError, ValueError):
+            LOG.warning('Notification de mise à jour non enregistrée')
 
 
 def notify_incident(key, failing, failure_message, recovery_message):
@@ -639,8 +679,11 @@ def runner_start(rule, selected):
     else:
         java_opts = _joal_java_opts(sum(len(payload) for payload in selected.values()))
         LOG.info("JOAL %s : %d torrent(s), mémoire %s", rid, len(selected), java_opts[0] if java_opts else "?")
+        # No embedded web server (v1.31): the controller never uses JOAL's web UI, whose random
+        # port listened on every interface (reachable from the LAN with a br0/br1 network).
+        # Measured on JOAL 2.1.37: 15 MiB and 15 threads less per session, telemetry unchanged.
         command = ["java", *java_opts, "-Dcontroller.telemetry=" + telemetry_path,
-                   "-jar", str(JAR), f"--joal-conf={root}"]
+                   "-jar", str(JAR), f"--joal-conf={root}", "--spring.main.web-application-type=none"]
     # Output goes through a pipe so joal.log can rotate (LOG_MAX_MB x LOG_BACKUPS).
     proc = None
     log = log_rotation.RotatingLog(root / "joal.log")
@@ -894,18 +937,34 @@ def live_joal_upload(*, include_totals=True):
             "zeroRate": sorted(zero_rate)}
 
 
+def tracker_domains():
+    """infohash -> first tracker domain, from the last published rows (qBittorrent and library)."""
+    with STATE_LOCK:
+        rows = [*STATUS.get('torrents', []), *STATUS.get('solo', {}).get('items', [])]
+    return {row['infoHash']: (row.get('trackers') or ['autre'])[0] for row in rows if row.get('infoHash')}
+
+
 def upload_history_loop():
     pending = deque(maxlen=3601)
     next_commit = time.monotonic() + 30
     path = DATA / "upload-history.sqlite"
+    domains, domains_at = {}, 0
     while not STOP.is_set():
         beat("upload-history")
         try:
-            rate = live_joal_upload(include_totals=False)["bytesPerSecond"]
+            measure = live_joal_upload(include_totals=False)
+            rate = measure["bytesPerSecond"]
         except Exception:
             LOG.debug("Débit JOAL illisible", exc_info=True)
-            rate = None
+            measure, rate = None, None
         now = int(time.time())
+        if STATS is not None and measure is not None:
+            if time.monotonic() - domains_at > 30:
+                domains, domains_at = tracker_domains(), time.monotonic()
+            try:
+                STATS.add(time.time(), measure.get("byInfoHash", {}), domains)
+            except Exception:
+                LOG.debug("Statistiques par tracker indisponibles", exc_info=True)
         with STATE_LOCK:
             UPLOAD_HISTORY.append((now, rate))
         pending.append((now, rate))
@@ -915,10 +974,17 @@ def upload_history_loop():
             try:
                 if SWARM_MONITOR is not None:
                     SWARM_MONITOR.flush_peers()
+                if STATS is not None:
+                    STATS.flush()
                 upload_history.store(path, list(pending))
                 pending.clear()
             except (OSError, sqlite3.Error):
                 LOG.warning("Historique des débits : écriture indisponible")
+    if STATS is not None:
+        try:
+            STATS.flush()
+        except OSError:
+            LOG.warning("Statistiques par tracker : dernière écriture indisponible")
     if pending:
         try:
             upload_history.store(path, list(pending))
@@ -1890,14 +1956,14 @@ def forget_torrent_settings(hashes):
     global TORRENT_MODES
     hashes = set(hashes)
     if not hashes:
-        return
+        return True
     if QBIT_URL:
         inventory = qbit_inventory_hashes(QBitClient(QBIT_URL, QBIT_USER, QBIT_PASS))
         if inventory is None:
-            return
+            return False
         hashes -= set(inventory)
     if not hashes:
-        return
+        return True
     try:
         with STATE_LOCK:
             conf = read_config()
@@ -1922,6 +1988,35 @@ def forget_torrent_settings(hashes):
                 TORRENT_MODES = updated
     except (OSError, ValueError, ConfigError):
         LOG.warning('Réglages des torrents retirés non nettoyés (configuration illisible ou non enregistrable)')
+        return False
+    return True
+
+
+def orphan_setting_hashes(conf):
+    """Hashes that have per-torrent settings but are no longer in the JOAL library."""
+    known = set(conf.get('torrentRuleOverrides', {})) | set(TORRENT_MODES)
+    for rule in conf.get('rules', []):
+        known |= set(rule.get('minLeechersByHash') or {})
+    if not known or SOLO_LIBRARY is None:
+        return set()
+    return known - {item['hash'] for item in SOLO_LIBRARY.list(conf['rules'])}
+
+
+def prune_orphan_settings(attempts=30, delay=60):
+    """Once after start (v1.31): settings left by torrents removed before v1.30.2.
+    forget_torrent_settings keeps every hash still in qBittorrent; it retries while
+    qBittorrent cannot be checked."""
+    for _ in range(attempts):
+        try:
+            orphans = orphan_setting_hashes(read_config())
+            if not orphans or forget_torrent_settings(orphans):
+                if orphans:
+                    LOG.info('Réglages orphelins vérifiés : %d torrent(s) examiné(s)', len(orphans))
+                return
+        except (OSError, ValueError, ConfigError, ImportErrorValue):
+            LOG.warning('Nettoyage des réglages orphelins reporté (configuration ou bibliothèque illisible)')
+        if STOP.wait(delay):
+            return
 
 
 def add_to_library(payload, filename, conf, source='Interface web'):
@@ -2893,6 +2988,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect('/login') if path == '/' else self.unauthorized()
         if path == '/api/qbit-connection':
             return self.send_json(qbit_settings.public(DATA))
+        if path == '/api/changelog':
+            seen = parse_qs(urlparse(self.path).query).get('since', ['0'])[0][:20]
+            if not re.fullmatch(r'\d+(?:\.\d+){0,3}', seen):
+                seen = '0'
+            return self.send_json({'current': APP_VERSION,
+                                   'sections': changelog.since(changelog.read(CHANGELOG_PATH), seen, APP_VERSION)})
+        if path == '/api/stats':
+            if STATS is None:
+                return self.send_json({'error': 'Statistiques indisponibles'}, 503)
+            try:
+                days = max(7, min(90, int(parse_qs(urlparse(self.path).query).get('days', ['30'])[0])))
+            except ValueError:
+                days = 30
+            return self.send_json(STATS.summary(days))
+        if path == '/api/alerts':
+            return self.send_json({**alerts.public(DATA), 'lastError': ALERTS.last_error if ALERTS else None})
         if path == '/api/interface-design':
             return self.send_json(interface_design.public(interface_design.current(DATA)))
         if path == '/api/notifications':
@@ -2918,14 +3029,16 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 return self.send_json({'infoHash': hashes[0].lower(), 'points': [], 'retentionDays': 14})
         if path == '/api/backup/export':
+            torrents = parse_qs(urlparse(self.path).query).get('torrents', ['1'])[0] != '0'
             try:
-                payload = build_backup(DATA)
+                payload = build_backup(DATA, include_torrents=torrents)
             except (OSError, ValueError):
                 return self.send_json({'error': 'Sauvegarde indisponible ou trop volumineuse'}, 503)
             self.send_response(200)
             self.send_header('Content-Type', 'application/zip')
             self.security_headers()
-            self.send_header('Content-Disposition', 'attachment; filename="joal-smart-data-backup.zip"')
+            self.send_header('Content-Disposition', 'attachment; filename="joal-smart-data-backup%s.zip"'
+                             % ('' if torrents else '-sans-torrents'))
             self.send_header('Content-Length', str(len(payload)))
             self.end_headers()
             return self.wfile.write(payload)
@@ -3008,6 +3121,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': 'Requête intersites interdite'}, 403)
         if not AUTH.verify_csrf(current_session, self.headers.get('X-CSRF-Token')):
             return self.send_json({'error': 'Jeton de sécurité manquant ou expiré'}, 403)
+        if path in ('/api/alerts', '/api/alerts/test'):
+            return self.save_alerts(path == '/api/alerts/test')
         if path == '/api/qbit-connection':
             if self.headers.get_content_type() != 'application/json':
                 return self.send_json({'error': 'JSON requis'}, 415)
@@ -3204,6 +3319,35 @@ class Handler(BaseHTTPRequestHandler):
             LOG.warning('Demande de basculement refusée (%s)', type(exc).__name__)
             return self.send_json({'error': 'État qBittorrent non vérifiable : demande refusée'}, 503)
 
+    def save_alerts(self, test):
+        """POST /api/alerts saves; POST /api/alerts/test sends a test with the saved settings."""
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            length = -1
+        if test:
+            config = alerts.load(DATA)
+            if not config['url']:
+                return self.send_json({'error': 'Enregistrer d’abord une adresse'}, 400)
+            try:
+                alerts.deliver(config, 'JOAL Smart : test', f'Alerte de test envoyée par JOAL Smart Controller v{APP_VERSION}.', 'info')
+            except OSError as exc:
+                return self.send_json({'error': f'Envoi impossible : {exc}'}, 502)
+            safe_audit('event', 'settings.alerts.test', 'Alerte de test envoyée')
+            return self.send_json({'success': True})
+        if self.headers.get_content_type() != 'application/json':
+            return self.send_json({'error': 'JSON requis'}, 415)
+        if not 0 < length <= 4096:
+            return self.send_json({'error': 'Taille de requête invalide'}, 413)
+        try:
+            result = alerts.save(DATA, json.loads(self.rfile.read(length)))
+        except (ValueError, UnicodeError) as exc:
+            return self.send_json({'error': str(exc) or 'Paramètres d’alerte invalides'}, 400)
+        except OSError:
+            return self.send_json({'error': 'Impossible d’enregistrer les alertes dans /data'}, 500)
+        safe_audit('event', 'settings.alerts', 'Alertes externes modifiées')
+        return self.send_json(result)
+
     def delete_solo(self, length):
         """Delete only the private .torrent metadata, never qBittorrent data.
 
@@ -3379,6 +3523,12 @@ def main():
             LOG.error('simulation-modes.json invalide : mis de côté, tous les torrents repassent en Auto')
     global NOTIFICATIONS
     NOTIFICATIONS = NotificationCenter(DATA / 'notifications.json')
+    global ALERTS
+    ALERTS = alerts.Dispatcher(DATA, LOG)
+    global STATS
+    STATS = tracker_stats.TrackerStats(DATA / 'tracker-stats.json')
+    NOTIFICATIONS.listeners.append(forward_alert)
+    announce_new_version()
     global CLEANUP_LEDGER
     CLEANUP_LEDGER = Ledger(DATA / "cleanup-observations.json")
     global SWARM_MONITOR
@@ -3419,6 +3569,7 @@ def main():
     history_worker.start()
     supervised(swarm_loop, "swarm").start()
     supervised(solo_loop, "solo", on_crash=stop_solo_runners).start()
+    threading.Thread(target=prune_orphan_settings, name="orphan-settings", daemon=True).start()
     if os.environ.get('IMPORT_WATCH', '1') != '0':
         supervised(import_watch_loop, "import-watch").start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

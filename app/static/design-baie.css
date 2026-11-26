@@ -544,3 +544,19 @@ dialog::backdrop{background:#1A232D73}
   .design-choice{min-width:0;flex:1 1 100%}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* v1.31 : statistiques par tracker */
+.stats-chart{margin:16px 0;padding:14px 16px;border:1px solid var(--border,var(--line));border-radius:var(--radius,8px)}
+.stats-chart figcaption{margin-bottom:8px;font-weight:600}
+.stats-chart svg{display:block;width:100%;height:150px}
+.stats-bar{fill:var(--accent,var(--link))}
+.stats-bar:hover{fill:var(--accent2,var(--ink))}
+.stats-axis{display:flex;justify-content:space-between;margin-top:6px;color:var(--muted,var(--ink-soft));font-size:12px}
+
+/* v1.31 : Nouveautés */
+.whats-new{max-height:60vh;overflow:auto}
+.whats-new-version h3{margin:16px 0 6px;font-size:15px}
+.whats-new-version ul{margin:0;padding-left:20px}
+.whats-new-version li{margin:4px 0;line-height:1.45}
+.link-button{background:none;border:0;padding:0;color:inherit;font:inherit;text-decoration:underline;cursor:pointer}
+.link-button:focus-visible{outline:2px solid currentColor;outline-offset:2px}

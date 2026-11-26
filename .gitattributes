@@ -1,0 +1,7 @@
+# Fins de ligne Linux partout (v1.31) : un fichier copié depuis un clone Windows,
+# par exemple unraid/update-joal.sh vers User Scripts, doit rester exécutable par bash.
+* text=auto eol=lf
+*.woff2 binary
+*.png binary
+*.zip binary
+*.torrent binary

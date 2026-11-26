@@ -1,5 +1,17 @@
 # Journal des versions
 
+## v1.31.0 · Alertes sur le téléphone, statistiques par tracker, sécurité
+
+- **Alertes sur le téléphone** (Paramètres) : les alertes du contrôleur (session JOAL arrêtée, qBittorrent injoignable, rétablissements, mise à jour installée) sont envoyées vers ntfy, Gotify ou Discord, au choix « problèmes seulement » ou « tout ». Bouton d'alerte de test. Le jeton reste dans `/data/alerts.json` (droits 0600), n'est jamais renvoyé à l'interface ni inclus dans les sauvegardes.
+- **Statistiques** (nouvelle page, menu Suivi et règles) : upload simulé par tracker aujourd'hui, sur 7 et 30 jours, temps de seed et nombre de torrents, graphique des 30 derniers jours. Mesuré chaque seconde sur les sessions JOAL, conservé 90 jours (`/data/tracker-stats.json`, inclus dans les sauvegardes).
+- **Nouveautés** : après une mise à jour, une fenêtre résume les changements depuis la dernière version vue dans ce navigateur. Lien « Nouveautés » en pied de page.
+- **Sécurité** : JOAL est lancé sans son serveur web intégré, qui écoutait sur un port aléatoire de toutes les interfaces (joignable depuis le réseau local avec un réseau `br0`/`br1`). Gain mesuré : 15 Mo et 15 threads par session, mesure d'upload inchangée.
+- **Sauvegarde** : case « Inclure les fichiers .torrent » ; décochée, la sauvegarde ne contient que les réglages, sans passkeys.
+- **Nettoyage unique** au démarrage des réglages laissés par des torrents retirés avant la v1.30.2 (règle affectée, seuil, mode), seulement s'ils ne sont ni dans la bibliothèque ni dans qBittorrent ; nouvel essai toutes les minutes si qBittorrent ne répond pas.
+- L'interface ne rafraîchit plus l'état ni les alertes quand son onglet est en arrière-plan.
+- **Build GitHub** : vérification du JavaScript et des 15 tests navigateur avant toute publication ; actions GitHub épinglées par empreinte ; une **Release GitHub** est créée à chaque image publiée, avec les notes de version et les versions de JOAL et Java.
+- `.gitattributes` : fins de ligne Linux forcées, pour qu'un script copié depuis un clone Windows (par exemple `update-joal.sh` dans User Scripts) reste exécutable.
+
 ## v1.30.2 · Retrait groupé des torrents importés
 
 - **Bouton « Retirer de JOAL (n) »** dans les barres de sélection (accueil, torrents, import) : retire en une fois les torrents importés cochés. Le compteur ne prend que les torrents de la bibliothèque JOAL ; les torrents qBittorrent de la sélection ne sont jamais touchés (la confirmation l'indique) et restent sélectionnés.

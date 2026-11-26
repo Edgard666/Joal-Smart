@@ -74,6 +74,13 @@ Au démarrage, le conteneur ajoute dans `/data/clients` les profils `.client` qu
 
 Le mode local (`update-joal.sh`, image `joal-smart-controller:local`) reste disponible ; il utilise les versions épinglées du `Dockerfile`.
 
+## Alertes, statistiques et nouveautés (v1.31)
+
+- **Alertes sur le téléphone** : *Paramètres → Alertes sur le téléphone*. Choisir ntfy (adresse du sujet, jeton facultatif), Gotify (adresse du serveur + jeton d'application) ou Discord (URL du webhook), puis « Envoyer une alerte de test ». « Les problèmes seulement » envoie les incidents ; « Tout » ajoute les rétablissements et les mises à jour installées. Le jeton reste dans `/data/alerts.json` et n'est jamais inclus dans une sauvegarde.
+- **Statistiques** : upload simulé par tracker (aujourd'hui, 7 et 30 jours), temps de seed, nombre de torrents et graphique des 30 derniers jours. Conservé 90 jours dans `/data/tracker-stats.json`.
+- **Nouveautés** : après une mise à jour, une fenêtre résume les changements ; lien « Nouveautés » en pied de page.
+- **Sauvegarde sans passkeys** : décocher « Inclure les fichiers .torrent » avant l'export.
+
 ## Variables principales
 
 | Variable | Défaut | Rôle |

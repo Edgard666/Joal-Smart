@@ -162,7 +162,7 @@ def main():
 
         def run_joal(conf, tele):
             return subprocess.Popen(['java', *java, f'-Dcontroller.telemetry={tele}/upload.json', '-jar', args.jar,
-                                     f'--joal-conf={conf}'], cwd=conf, env=env,
+                                     f'--joal-conf={conf}', '--spring.main.web-application-type=none'], cwd=conf, env=env,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         joal_check(run_joal, ROOT / 'clients')
         return
@@ -171,7 +171,7 @@ def main():
         return subprocess.Popen(['docker', 'run', '--rm', '--network', 'host', '--entrypoint', 'java',
                                  '-v', f'{conf}:/conf', '-v', f'{tele}:/tele', '-w', '/conf', args.image,
                                  *java, '-Dcontroller.telemetry=/tele/upload.json', '-jar', '/opt/joal/joal.jar',
-                                 '--joal-conf=/conf'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 '--joal-conf=/conf', '--spring.main.web-application-type=none'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     joal_check(run_joal, ROOT / 'clients')
     controller_check(args.image)
 

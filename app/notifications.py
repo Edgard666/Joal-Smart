@@ -1,4 +1,5 @@
-"""Persistent, in-app operational alerts. No external delivery and no secrets."""
+"""Persistent, in-app operational alerts (no secrets). Listeners receive each new
+alert, e.g. for external delivery (alerts.py, v1.31)."""
 from __future__ import annotations
 import datetime as dt
 import json
@@ -20,6 +21,7 @@ class NotificationCenter:
         self.items = []
         self.states = {}
         self.load_error = False
+        self.listeners = []         # callables(item), called outside the lock
         try:
             if self.path.is_file():
                 data = json.loads(self.path.read_text(encoding='utf-8'))
@@ -55,13 +57,34 @@ class NotificationCenter:
             if before == failing:
                 return False
             self.states[key] = failing
-            self.items.append({'id': os.urandom(12).hex(), 'at': _stamp(),
-                               'category': key, 'level': 'error' if failing else 'success',
-                               'message': str(failure_text if failing else recovery_text)[:200],
-                               'read': False})
+            item = {'id': os.urandom(12).hex(), 'at': _stamp(),
+                    'category': key, 'level': 'error' if failing else 'success',
+                    'message': str(failure_text if failing else recovery_text)[:200], 'read': False}
+            self.items.append(item)
             self.items = self.items[-MAX_ALERTS:]
             self._save()
-            return True
+        self._announce(item)
+        return True
+
+    def post(self, key, level, message):
+        """One-off alert (not an incident/recovery pair), e.g. « mis à jour en v1.31.0 »."""
+        if not isinstance(key, str) or len(key) > 64 or not key or level not in ('info', 'success', 'error'):
+            raise ValueError('alerte invalide')
+        item = {'id': os.urandom(12).hex(), 'at': _stamp(), 'category': key, 'level': level,
+                'message': str(message)[:200], 'read': False}
+        with self.lock:
+            self.items.append(item)
+            self.items = self.items[-MAX_ALERTS:]
+            self._save()
+        self._announce(item)
+        return item
+
+    def _announce(self, item):
+        for listener in list(self.listeners):
+            try:
+                listener(dict(item))
+            except Exception:
+                pass
 
     def snapshot(self):
         with self.lock:

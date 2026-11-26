@@ -15,6 +15,7 @@
     diagnostics: ['Diagnostics & historique', 'État du système, événements et sessions JOAL enregistrées.'],
     json: ['Configuration avancée', 'Modification directe de policy.json.'],
     health: ['Santé', 'Threads de surveillance, journaux, stockage et dossier surveillé.'],
+    stats: ['Statistiques', 'Upload simulé par tracker et par jour.'],
     backup: ['Sauvegardes persistantes', 'Archivage et restauration contrôlée des données de /data.']
   };
   const deepcopy = obj => JSON.parse(JSON.stringify(obj));
@@ -74,9 +75,10 @@
     $('page-title').textContent = views[target][0];
     $('page-subtitle').textContent = views[target][1];
     if (target === 'rules') renderRuleEditor();
-    if (target === 'settings') { renderSettings(); if (!qbitReady) loadQbit(); }
+    if (target === 'settings') { renderSettings(); if (!qbitReady) loadQbit(); loadAlerts(); }
     if (target === 'torrents') { renderTorrents(); requestAnimationFrame(updateTorrentScrollbar); }
     if (target === 'cleanup') renderCleanup();
+    if (target === 'stats') renderStats();
     if (target === 'swarm') renderSwarm();
     if (target === 'import') renderSolo();
     if (target === 'diagnostics') renderDiagnostics();
@@ -1192,6 +1194,71 @@
     }
   }
 
+  // v1.31 « Nouveautés » : shown once per browser after an update; the first visit records the version silently.
+  const SEEN_KEY = 'joal.seenVersion';
+  function seenVersion() { try { return localStorage.getItem(SEEN_KEY); } catch (_) { return null; } }
+  function rememberVersion(version) { try { localStorage.setItem(SEEN_KEY, version); } catch (_) { /* private mode */ } }
+  async function showWhatsNew(since, automatic) {
+    let data;
+    try { data = await api('/api/changelog?since=' + encodeURIComponent(since || '0')); } catch (_) { return; }
+    const sections = automatic ? data.sections : data.sections.slice(0, 5);
+    if (!sections.length) { rememberVersion(data.current); return; }
+    $('whats-new-subtitle').textContent = automatic ? `Mise à jour installée : v${data.current}` : `Version installée : v${data.current}`;
+    $('whats-new-items').replaceChildren(...sections.map(section => {
+      const block = newEl('section', 'whats-new-version');
+      block.append(newEl('h3', '', `v${section.version}${section.title ? ' · ' + section.title : ''}`));
+      const list = newEl('ul');
+      for (const item of section.items) list.append(newEl('li', '', item));
+      block.append(list);
+      return block;
+    }));
+    const dialog = $('whats-new-dialog');
+    if (!dialog.open) dialog.showModal();
+    rememberVersion(data.current);
+  }
+  async function checkWhatsNew() {
+    const seen = seenVersion();
+    if (!seen) {                      // first visit in this browser: nothing to announce
+      try { rememberVersion((await api('/api/changelog?since=99999')).current); } catch (_) { /* offline */ }
+      return;
+    }
+    await showWhatsNew(seen, true);  // no section newer than `seen`: no window
+  }
+  function seedTime(seconds) {
+    if (!seconds) return '—';
+    const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60);
+    return hours ? `${hours} h ${String(minutes).padStart(2, '0')}` : `${minutes} min`;
+  }
+  async function renderStats() {
+    if (app.view !== 'stats') return;
+    let data;
+    try { data = await api('/api/stats?days=30'); }
+    catch (error) { $('stats-items').replaceChildren(newEl('tr', '', '')); showToast(error.message, true); return; }
+    $('stats-today').textContent = formatBytes(data.totals.today);
+    $('stats-week').textContent = formatBytes(data.totals.week);
+    $('stats-month').textContent = formatBytes(data.totals.month);
+    $('stats-trackers').textContent = String(data.trackers.filter(t => t.month.bytes > 0).length);
+    $('stats-first-day').textContent = new Date(data.days[0] + 'T12:00:00').toLocaleDateString('fr-FR', {day: 'numeric', month: 'short'});
+    const svg = $('stats-chart'); svg.replaceChildren();
+    const peak = Math.max(1, ...data.daily), width = 600 / data.daily.length;
+    data.daily.forEach((value, index) => {
+      const height = value ? Math.max(2, value / peak * 140) : 0;
+      const bar = addSvg(svg, 'rect', {x: index * width + 1, y: 150 - height, width: Math.max(1, width - 2), height, class: 'stats-bar'});
+      const day = new Date(data.days[index] + 'T12:00:00').toLocaleDateString('fr-FR', {weekday: 'short', day: 'numeric', month: 'short'});
+      addSvg(bar, 'title', {}, `${day} : ${formatBytes(value)}`);
+    });
+    const body = $('stats-items');
+    if (!data.trackers.length) {
+      const row = newEl('tr'); const cell = newEl('td', 'muted', 'Aucune session JOAL mesurée sur la période. Les chiffres apparaissent dès qu’une session tourne.');
+      cell.colSpan = 6; row.append(cell); body.replaceChildren(row); return;
+    }
+    body.replaceChildren(...data.trackers.map(t => {
+      const row = newEl('tr');
+      row.append(newEl('td', '', t.domain), newEl('td', '', formatBytes(t.today.bytes)), newEl('td', '', formatBytes(t.week.bytes)),
+                 newEl('td', '', formatBytes(t.month.bytes)), newEl('td', '', seedTime(t.month.seconds)), newEl('td', '', String(t.torrents)));
+      return row;
+    }));
+  }
   function addSvg(parent, tag, attributes = {}, text = null) {
     const child = document.createElementNS('http://www.w3.org/2000/svg', tag);
     for (const [key, value] of Object.entries(attributes)) child.setAttribute(key, String(value));
@@ -1418,14 +1485,16 @@
   }
   async function downloadFullBackup() {
     try {
-      const res = await fetch('/api/backup/export',{credentials:'same-origin',cache:'no-store'});
+      const withTorrents = $('backup-with-torrents')?.checked !== false;
+      const res = await fetch('/api/backup/export' + (withTorrents ? '' : '?torrents=0'),{credentials:'same-origin',cache:'no-store'});
       if (res.status===401) {location.replace('/login');return;}
       if (!res.ok) {const data=await res.json();throw new Error(data.error||'Export impossible');}
       const blob=await res.blob();
       const uri=URL.createObjectURL(blob); const anchor=newEl('a');
-      anchor.href=uri;anchor.download='joal-smart-data-'+new Date().toISOString().slice(0,10)+'.zip';
+      anchor.href=uri;anchor.download='joal-smart-data-'+new Date().toISOString().slice(0,10)+(withTorrents?'':'-sans-torrents')+'.zip';
       document.body.append(anchor);anchor.click();anchor.remove();setTimeout(()=>URL.revokeObjectURL(uri),1000);
-      showToast('Sauvegarde téléchargée — fichier confidentiel.');
+      showToast(withTorrents ? 'Sauvegarde téléchargée. Elle contient tes passkeys : garde-la en lieu sûr.'
+                             : 'Sauvegarde des réglages téléchargée, sans fichiers .torrent.');
     } catch (error) {showToast(error.message,true);}
   }
   async function uploadFullBackup() {
@@ -1570,6 +1639,47 @@
       $('qbit-message').textContent = 'Connexion enregistrée et appliquée immédiatement.';
     } catch (error) { $('qbit-message').textContent = error.message; }
     finally { $('qbit-save').disabled = $('qbit-docker').disabled = false; }
+  }
+  const ALERT_HELP = {
+    ntfy: 'Adresse du sujet, par exemple https://ntfy.sh/mon-sujet-secret ou celle de ton serveur ntfy. Jeton : seulement si le sujet est protégé.',
+    gotify: 'Adresse du serveur Gotify (sans /message) et jeton d’une application créée dans Gotify.',
+    discord: 'URL du webhook du salon : Paramètres du salon → Intégrations → Webhooks → Copier l’URL. Pas de jeton.'};
+  function showAlerts(config) {
+    $('alerts-enabled').checked = !!config.enabled;
+    $('alerts-kind').value = config.kind;
+    $('alerts-level').value = config.level;
+    $('alerts-url').value = config.url || '';
+    $('alerts-token').value = '';
+    $('alerts-token').placeholder = config.hasToken ? 'Déjà configuré' : (config.kind === 'gotify' ? 'Jeton de l’application' : 'Facultatif');
+    $('alerts-clear-token').checked = false;
+    $('alerts-help').textContent = ALERT_HELP[config.kind] || '';
+    if (config.lastError) $('alerts-message').textContent = 'Dernier envoi en échec : ' + config.lastError;
+  }
+  async function loadAlerts() {
+    try { showAlerts(await api('/api/alerts')); } catch (error) { $('alerts-message').textContent = error.message; }
+  }
+  async function saveAlerts(event) {
+    event?.preventDefault();
+    const body = {enabled:$('alerts-enabled').checked, kind:$('alerts-kind').value, level:$('alerts-level').value,
+                  url:$('alerts-url').value.trim()};
+    if ($('alerts-token').value || $('alerts-clear-token').checked) body.token = $('alerts-clear-token').checked ? '' : $('alerts-token').value;
+    $('alerts-save').disabled = $('alerts-test').disabled = true;
+    try {
+      showAlerts(await api('/api/alerts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}));
+      $('alerts-message').textContent = 'Alertes enregistrées.';
+      return true;
+    } catch (error) { $('alerts-message').textContent = error.message; return false; }
+    finally { $('alerts-save').disabled = $('alerts-test').disabled = false; }
+  }
+  async function testAlerts() {
+    if (!await saveAlerts()) return;
+    $('alerts-save').disabled = $('alerts-test').disabled = true;
+    $('alerts-message').textContent = 'Envoi de l’alerte de test…';
+    try {
+      await api('/api/alerts/test', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+      $('alerts-message').textContent = 'Alerte de test envoyée : vérifie ton téléphone.';
+    } catch (error) { $('alerts-message').textContent = error.message; }
+    finally { $('alerts-save').disabled = $('alerts-test').disabled = false; }
   }
   function renderSettings() {
     if (!app.config) return;
@@ -2099,6 +2209,15 @@
       $(id).addEventListener('input', () => { cfgCleanup()[key] = $(id).value === '' ? null : Number($(id).value); updateDirty(); });
     }
     $('qbit-connection').addEventListener('submit', event => { event.preventDefault(); saveQbit(false); });
+    $('alerts-form').addEventListener('submit', saveAlerts);
+    $('stats-refresh').addEventListener('click', renderStats);
+    $('whats-new-close').addEventListener('click', () => $('whats-new-dialog').close());
+    $('whats-new-open').addEventListener('click', () => showWhatsNew('0', false));
+    $('alerts-test').addEventListener('click', testAlerts);
+    $('alerts-kind').addEventListener('change', () => {
+      $('alerts-help').textContent = ALERT_HELP[$('alerts-kind').value] || '';
+      if (!$('alerts-token').value) $('alerts-token').placeholder = $('alerts-kind').value === 'gotify' ? 'Jeton de l’application' : 'Facultatif';
+    });
     $('qbit-docker').addEventListener('click', () => saveQbit(true));
     $('save-settings').addEventListener('click', () => saveConfig(app.config));
     $('cancel-settings').addEventListener('click', () => { if (dirty() && !confirm('Annuler les modifications non enregistrées ?')) return; app.config = deepcopy(app.saved); renderSettings(); renderRuleEditor(); });
@@ -2131,9 +2250,12 @@
     try { app.clients = (await api('/api/clients')).clients || []; } catch (_e) { /* clients optional for dry-run */ }
     await fetchStatus();
     await refreshNotifications();
-    setInterval(fetchStatus, 5000);
+    void checkWhatsNew();
+    // v1.31: no polling while the tab is in the background; fresh state as soon as it is back.
+    setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) void fetchStatus(); });
     setInterval(() => { if (app.view === 'health') renderHealth(); }, 10000);
-    setInterval(refreshNotifications, 30000);
+    setInterval(() => { if (!document.hidden) refreshNotifications(); }, 30000);
   }
   init();
 })();

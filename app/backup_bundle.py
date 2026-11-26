@@ -21,7 +21,7 @@ from torrent_import import MAX_TORRENT_BYTES, ImportErrorValue, validate_torrent
 PERSISTENT_JSON = frozenset({
     'policy.json', 'tracker-registry.json', 'cleanup-observations.json',
     'handoff-state.json', 'diagnostics.json', 'notifications.json', 'simulation-modes.json',
-    'interface.json'
+    'interface.json', 'tracker-stats.json'
 })
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_TOTAL = 60 * 1024 * 1024
@@ -75,8 +75,11 @@ def list_files(root):
     return found
 
 
-def build_backup(root):
-    files = list_files(root)
+def build_backup(root, include_torrents=True):
+    """include_torrents=False (v1.31): settings only, without the .torrent files that hold
+    the private tracker URLs (passkeys)."""
+    files = [(name, path) for name, path in list_files(root)
+             if include_torrents or not name.startswith('torrents/')]
     if len(files) > MAX_ITEMS:
         raise ValueError('Trop de fichiers à sauvegarder')
     total = 0

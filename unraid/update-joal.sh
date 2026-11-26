@@ -77,7 +77,7 @@ if [ "$BUILD_IMAGE" = "yes" ]; then
   [ "$NO_CACHE" = "yes" ] && opts+=(--no-cache)
   candidate="joal-smart-controller:verification-$$"
   trap 'docker image rm "$candidate" >/dev/null 2>&1 || true' EXIT
-  tar --exclude='__pycache__' --exclude='*.pyc' -cf - Dockerfile .dockerignore app telemetry clients config.example.json docker-entrypoint.sh |
+  tar --exclude='__pycache__' --exclude='*.pyc' -cf - Dockerfile .dockerignore app telemetry clients config.example.json CHANGELOG.md docker-entrypoint.sh |
     docker build "${opts[@]}" -t "$candidate" - || fail "build Docker échoué (voir ci-dessus)"
   built=$(docker run --rm --user 99:100 --entrypoint python3 "$candidate" -B -c \
     'import main; print(main.APP_VERSION)') || fail "application illisible avec UID 99 / GID 100"
