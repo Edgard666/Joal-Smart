@@ -210,6 +210,25 @@ class SoloLibrary:
                     continue
         return result
 
+    def delete_many(self, infohashes):
+        """Delete several .torrent files in a single pass over the library (v1.30.2).
+        Returns the set of hashes actually removed; unknown hashes are ignored."""
+        wanted = {str(h).lower() for h in infohashes}
+        if not wanted or not all(HASH.fullmatch(h) for h in wanted):
+            raise ImportErrorValue('Infohash invalide')
+        removed = set()
+        with self._lock:
+            for path in self._torrent_paths():
+                try:
+                    existing_hash = self._file_hash(path)
+                except (OSError, ValueError, ImportErrorValue, RecursionError):
+                    continue
+                if existing_hash in wanted and existing_hash not in removed:
+                    path.unlink()
+                    self._hashes.pop(path, None)
+                    removed.add(existing_hash)
+        return removed
+
     def delete(self, infohash):
         h = str(infohash).lower()
         if not HASH.fullmatch(h):

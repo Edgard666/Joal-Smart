@@ -1,5 +1,11 @@
 # Journal des versions
 
+## v1.30.2 · Retrait groupé des torrents importés
+
+- **Bouton « Retirer de JOAL (n) »** dans les barres de sélection (accueil, torrents, import) : retire en une fois les torrents importés cochés. Le compteur ne prend que les torrents de la bibliothèque JOAL ; les torrents qBittorrent de la sélection ne sont jamais touchés (la confirmation l'indique) et restent sélectionnés.
+- API : `/api/solo/delete` accepte aussi `{"infoHashes": [...]}` (jusqu'à 500), traité en une seule lecture de la bibliothèque ; la réponse liste les torrents retirés et ceux déjà absents.
+- **Correction** : retirer un torrent importé laissait sa règle affectée, son seuil de leechers individuel et son mode Stop/Forced dans la configuration. Ils sont maintenant effacés, sauf si le même torrent est dans qBittorrent (ils s'y appliquent encore) ou si qBittorrent ne répond pas.
+
 ## v1.30.1 · `.gitignore` protège les données
 
 - `.gitignore` exclut désormais `data/` (passkeys dans les `.torrent`, réglages), `.env` (mot de passe) et les archives `.zip` : un `git add .` lancé par erreur dans le dossier d'installation n'envoie plus de secrets sur GitHub.

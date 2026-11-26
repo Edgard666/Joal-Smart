@@ -1883,6 +1883,47 @@ def import_probe_allowed(h):
     return hashes is not None and h not in hashes
 
 
+def forget_torrent_settings(hashes):
+    """Drop the per-torrent settings of removed library torrents (v1.30.2): assigned rule,
+    per-torrent leecher threshold and Stop/Forced mode. Kept when the same torrent is in
+    qBittorrent (they still apply there) or when qBittorrent cannot be checked."""
+    global TORRENT_MODES
+    hashes = set(hashes)
+    if not hashes:
+        return
+    if QBIT_URL:
+        inventory = qbit_inventory_hashes(QBitClient(QBIT_URL, QBIT_USER, QBIT_PASS))
+        if inventory is None:
+            return
+        hashes -= set(inventory)
+    if not hashes:
+        return
+    try:
+        with STATE_LOCK:
+            conf = read_config()
+            changed = False
+            overrides = conf.get('torrentRuleOverrides', {})
+            for h in hashes & set(overrides):
+                del overrides[h]
+                changed = True
+            for rule in conf.get('rules', []):
+                thresholds = rule.get('minLeechersByHash') or {}
+                for h in hashes & set(thresholds):
+                    del thresholds[h]
+                    changed = True
+            if changed:
+                write_config(conf)
+        with RUNNER_LOCK:
+            if hashes & set(TORRENT_MODES):
+                updated = {h: mode for h, mode in TORRENT_MODES.items() if h not in hashes}
+                tmp = DATA / 'simulation-modes.tmp'
+                tmp.write_text(json.dumps(updated), encoding='utf-8')
+                tmp.replace(DATA / 'simulation-modes.json')
+                TORRENT_MODES = updated
+    except (OSError, ValueError, ConfigError):
+        LOG.warning('Réglages des torrents retirés non nettoyés (configuration illisible ou non enregistrable)')
+
+
 def add_to_library(payload, filename, conf, source='Interface web'):
     """Store one .torrent in the JOAL-only library and register it everywhere.
 
@@ -3164,25 +3205,43 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': 'État qBittorrent non vérifiable : demande refusée'}, 503)
 
     def delete_solo(self, length):
-        """Delete only the private .torrent metadata, never qBittorrent data."""
+        """Delete only the private .torrent metadata, never qBittorrent data.
+
+        {"infoHash": h} removes one file (404 when absent); {"infoHashes": [...]} (v1.30.2,
+        up to 500) removes the selection in one pass and reports the hashes not found."""
         try:
             body = json.loads(self.rfile.read(length))
-            if not isinstance(body, dict) or set(body) != {'infoHash'}:
+            if not isinstance(body, dict) or set(body) not in ({'infoHash'}, {'infoHashes'}):
                 raise ValueError('Corps invalide')
-            h = str(body['infoHash']).lower()
-            if not HASH_RE.fullmatch(h) or SOLO_LIBRARY is None:
+            single = 'infoHash' in body
+            raw = [body['infoHash']] if single else body['infoHashes']
+            if not isinstance(raw, list) or not 1 <= len(raw) <= 500:
+                raise ValueError('Liste invalide')
+            hashes = list(dict.fromkeys(str(h).lower() for h in raw))
+            if SOLO_LIBRARY is None or not all(HASH_RE.fullmatch(h) for h in hashes):
                 raise ValueError('Infohash invalide')
+            wanted = set(hashes)
             with SOLO_EDIT_LOCK, RUNNER_LOCK:
-                for rid, hashes in list(ACTIVE_HASHES.items()):
-                    if rid.startswith('solo-') and h in hashes:
+                for rid, active in list(ACTIVE_HASHES.items()):
+                    if rid.startswith('solo-') and active & wanted:
                         runner_stop(rid)
-                SOLO_LIBRARY.delete(h)
-                publish_solo_edit(h)
-                if SWARM_MONITOR is not None:
-                    SWARM_MONITOR.forget_solo(h)
-            safe_audit('event', 'solo.removed', 'Fichier .torrent JOAL uniquement retiré', infohash=h)
+                removed = SOLO_LIBRARY.delete_many(hashes)
+                for h in hashes:
+                    if h in removed:
+                        publish_solo_edit(h)
+                        if SWARM_MONITOR is not None:
+                            SWARM_MONITOR.forget_solo(h)
+            if single and not removed:
+                raise FileNotFoundError(hashes[0])
+            forget_torrent_settings(removed)
+            for h in hashes:
+                if h in removed:
+                    safe_audit('event', 'solo.removed', 'Fichier .torrent JOAL uniquement retiré', infohash=h)
             SWARM_NOW.set()
-            return self.send_json({'success': True, 'infoHash': h})
+            if single:
+                return self.send_json({'success': True, 'infoHash': hashes[0]})
+            return self.send_json({'success': True, 'removed': [h for h in hashes if h in removed],
+                                   'missing': [h for h in hashes if h not in removed]})
         except (ValueError, TypeError, ImportErrorValue):
             return self.send_json({'error': 'Demande de retrait invalide'}, 400)
         except FileNotFoundError:

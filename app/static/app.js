@@ -441,6 +441,32 @@
     updateToggle(document.querySelector('[data-toggle-all="' + view + '"]'));
   }
   let modeBusy = false;
+  // Only torrents of the JOAL-only library can be removed; qBittorrent ones are never touched.
+  function selectedLibraryHashes() {
+    const library = new Set((((app.state || {}).solo || {}).items || []).map(row => row.infoHash));
+    return [...selectedModes].filter(h => library.has(h));
+  }
+  async function removeSelectedLibrary() {
+    const hashes = selectedLibraryHashes();
+    if (modeBusy || !hashes.length) return;
+    const others = selectedModes.size - hashes.length;
+    const note = others ? `\n\n${others} torrent(s) qBittorrent de la sélection ne seront pas touchés.` : '';
+    if (!confirm(`Retirer ${hashes.length} torrent(s) importé(s) de JOAL ? Les fichiers .torrent seront supprimés de la bibliothèque, jamais les données qBittorrent.${note}`)) return;
+    modeBusy = true;
+    for (const h of hashes) removing.add(h);
+    syncModeControls(); renderSolo();
+    try {
+      const result = await api('/api/solo/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({infoHashes:hashes})});
+      for (const h of result.removed || []) { applyLibraryEdit([], h); selectedModes.delete(h); }
+      const missing = (result.missing || []).length;
+      showToast(`${(result.removed || []).length} fichier(s) .torrent retiré(s).` + (missing ? ` ${missing} déjà absent(s).` : ''));
+    } catch (error) { showToast(error.message, true); }
+    finally {
+      for (const h of hashes) removing.delete(h);
+      modeBusy = false; syncModeControls(); renderSolo(); void fetchStatus();
+    }
+  }
   function syncModeControls() {
     for (const button of document.querySelectorAll('[data-toggle-all]')) updateToggle(button);
     for (const box of document.querySelectorAll('input[data-mode-hash]')) {
@@ -450,6 +476,11 @@
     for (const label of document.querySelectorAll('.mode-count')) label.textContent = selectedModes.size + ' sélectionné(s)';
     for (const button of document.querySelectorAll('[data-batch-mode],[data-batch-rule],[data-clear-mode]')) {
       button.disabled = modeBusy || !selectedModes.size;
+    }
+    const removable = selectedLibraryHashes();
+    for (const button of document.querySelectorAll('[data-batch-remove]')) {
+      button.textContent = removable.length ? `Retirer de JOAL (${removable.length})` : 'Retirer de JOAL';
+      button.disabled = modeBusy || !removable.length;
     }
     for (const select of document.querySelectorAll('.torrent-mode-choice')) select.disabled = modeBusy;
   }
@@ -1943,6 +1974,9 @@
     }
     for (const button of document.querySelectorAll('[data-batch-rule]')) {
       button.addEventListener('click', () => openTorrentRuleDialog([...selectedModes]));
+    }
+    for (const button of document.querySelectorAll('[data-batch-remove]')) {
+      button.addEventListener('click', removeSelectedLibrary);
     }
     for (const button of document.querySelectorAll('[data-toggle-all]')) {
       button.addEventListener('click', () => {
