@@ -46,7 +46,7 @@ Chaque processus JOAL correspond à une règle, car les débits JOAL sont globau
    docker build -t joal-smart-controller:local .
    ```
 3. Importer `unraid/my-joal-smart-controller.xml` (ou utiliser `docker compose up -d` avec un `.env` copié depuis `.env.example`).
-4. Définir `ADMIN_PASSWORD` (12 caractères minimum). Copier les profils `.client` de JOAL dans `data/clients/`.
+4. Définir `ADMIN_PASSWORD` (12 caractères minimum) ou `ADMIN_PASSWORD_HASH`. Copier les profils `.client` de JOAL dans `data/clients/`.
 5. Ouvrir la WebUI (utilisateur `admin`) et configurer qBittorrent et les règles. La connexion qBittorrent s'applique immédiatement.
 
 **Mise à jour** : conserver `data/` et `.env`, remplacer le code, puis lancer `unraid/update-joal.sh` dans **User Scripts** (options modifiables en haut du script). Le script construit l'image et met à jour les capacités du template. Il supprime aussi, si les options sont à `yes` : les fichiers d'anciennes versions absents du zip (`CLEAN_OLD_FILES`, jamais `data/` ni `.env`), les anciennes images de l'application (`CLEAN_OLD_IMAGES`) et le cache de build inutilisé depuis 7 jours (`CLEAN_BUILD_CACHE`). Terminer par **Docker → Edit → Apply**.
@@ -81,11 +81,51 @@ Le mode local (`update-joal.sh`, image `joal-smart-controller:local`) reste disp
 - **Nouveautés** : après une mise à jour, une fenêtre résume les changements ; lien « Nouveautés » en pied de page.
 - **Sauvegarde sans passkeys** : décocher « Inclure les fichiers .torrent » avant l'export.
 
+## Discrétion vis-à-vis des trackers (v1.33)
+
+- Un torrent qui entre ou sort d'une session est ajouté ou retiré **à chaud** : JOAL n'est plus relancé, les autres torrents ne réannoncent pas. Un seul JOAL par règle (torrents qBittorrent et importés).
+- Relevés : rien pour un torrent déjà annoncé par JOAL ; plusieurs torrents d'un même tracker en une requête ; requêtes espacées et non périodiques ; un torrent resté sans leecher est relevé de moins en moins souvent (Paramètres → Relevés indépendants → « Intervalle max. sans leecher », 240 min par défaut).
+- Les relevés du contrôleur après une session reprennent l'identité (peer_id, clé, port) que JOAL utilisait.
+- La page Règles signale un profil `.client` différent du qBittorrent réel et propose le bon.
+- v1.34 : JOAL annonce le port d'écoute du vrai qBittorrent (Paramètres → « Annoncer le port de qBittorrent », activé par défaut) et n'interroge plus aucun site d'adresse IP publique. Les torrents qui partagent dans qBittorrent ne sont plus relevés (sauf basculement automatique activé).
+
+## Sécurité du compte et widget (v1.32)
+
+- **Mot de passe** : modifiable dans Paramètres → Sécurité. Il est enregistré haché (scrypt) dans `/data/admin-password.json` et devient prioritaire sur Docker. L'interface affiche le hash à reporter dans `ADMIN_PASSWORD_HASH` si on veut retirer le mot de passe en clair de Docker → Edit. Changer le mot de passe ferme les autres sessions.
+- **Déconnecter les autres sessions** : bouton dans Paramètres → Sécurité.
+- **Double authentification** (facultative) : clé à ajouter dans Aegis, 2FAS, Google Authenticator… puis code à 6 chiffres à chaque connexion. Téléphone perdu : `DISABLE_TOTP=1`, redémarrer, désactiver dans Paramètres, remettre `0`.
+- **Plafond quotidien par règle** : champ « Plafond d'upload simulé par jour » dans l'éditeur de règles. Une fois atteint, les sessions de la règle s'arrêtent jusqu'à minuit (heure du conteneur). Les torrents en Forced ne sont pas plafonnés.
+- **Export CSV** des statistiques (page Statistiques, 90 jours, séparateur `;`, ouvre directement dans Excel).
+- **Widget** (Homepage, Homarr, Home Assistant) : créer un jeton dans Paramètres → Widget. Il ne donne accès qu'à `GET /api/widget` (débit, volume du jour, sessions, état qBittorrent, versions). Exemple Homepage :
+
+```yaml
+- JOAL Smart:
+    href: http://IP-UNRAID:8788
+    widget:
+      type: customapi
+      url: http://IP-UNRAID:8788/api/widget
+      headers:
+        Authorization: Bearer jsw_…
+      mappings:
+        - field: uploadKiBps
+          label: Débit
+          suffix: " Kio/s"
+        - field: uploadedTodayGiB
+          label: Aujourd’hui
+          suffix: " Gio"
+        - field: activeTorrents
+          label: Torrents
+```
+
+- **Trackers** : les relevés (scrapes) envoient les mêmes en-têtes HTTP que le profil `.client` de JOAL, se connectent à l'adresse IP déjà vérifiée (protection DNS rebinding), et les URL des trackers (passkeys) sont masquées dans `joal.log`.
+
 ## Variables principales
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `ADMIN_PASSWORD` | — | Mot de passe de la WebUI (obligatoire) |
+| `ADMIN_PASSWORD` | — | Mot de passe de la WebUI (12 caractères minimum) |
+| `ADMIN_PASSWORD_HASH` | vide | Hash scrypt à la place du mot de passe en clair (prioritaire sur `ADMIN_PASSWORD`) |
+| `DISABLE_TOTP` | `0` | `1` coupe la double authentification (récupération) |
 | `QBIT_URL`, `QBIT_USERNAME`, `QBIT_PASSWORD` | vide | Valeurs par défaut de la connexion (modifiables dans la WebUI) |
 | `PUID`, `PGID` | `99`, `100` | Utilisateur d'exécution (Unraid `nobody:users`) |
 | `TORRENT_FILE_MODE`, `TORRENT_DIR_MODE` | `0660`, `0770` | Permissions de `/data/torrents` |

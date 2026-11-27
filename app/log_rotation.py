@@ -8,6 +8,7 @@ rotate while the JVM is running.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -22,6 +23,19 @@ def _env_int(name, default, low, high):
 
 MAX_BYTES = _env_int("LOG_MAX_MB", 5, 1, 500) * 1024 * 1024
 BACKUPS = _env_int("LOG_BACKUPS", 3, 1, 20)
+
+
+# Tracker URLs carry passkeys in their path or query. Only scheme://host stays
+# in joal.log (v1.32); fixed JOAL messages used for diagnostics are untouched.
+_URL = re.compile(rb'\b((?:https?|udp)://)([^/\s?#"\'<>]+)[^\s"\'<>]*', re.IGNORECASE)
+_SECRET = re.compile(rb'\b(passkey|authkey|torrent_pass|pk|apikey|api_key|token)=[^&\s"\'<>]+', re.IGNORECASE)
+
+
+def redact(line: bytes) -> bytes:
+    if b'://' not in line and b'=' not in line:
+        return line
+    line = _URL.sub(lambda m: m.group(1) + m.group(2).rsplit(b'@', 1)[-1] + b'/\xe2\x80\xa6', line)
+    return _SECRET.sub(lambda m: m.group(1) + b'=\xe2\x80\xa6', line)
 
 
 class RotatingLog:
@@ -80,7 +94,7 @@ def pump(stream, log: RotatingLog, on_line=None):
             if not isinstance(line, bytes):
                 break
             try:
-                log.write(line)
+                log.write(redact(line))
             except OSError:
                 pass  # A full disk must not block the child on a full pipe.
             if on_line is not None:

@@ -156,6 +156,10 @@ def validate(config: dict) -> dict:
     if handoff["enabled"] and not config.get("swarm", {}).get("enabled", True):
         raise ConfigError("Activer les relevés autonomes avant le basculement")
     config.setdefault("guardSeconds", 5)
+    # v1.34: JOAL announces the real qBittorrent listening port (same client seen by the tracker).
+    config.setdefault("announceQbitPort", True)
+    if type(config["announceQbitPort"]) is not bool:
+        raise ConfigError("announceQbitPort doit être true ou false")
     config.setdefault("cleanup", {"enabled": False, "afterDays": 3, "deleteData": False, "scrapeEveryMinutes": 60})
     config.setdefault("swarm", {"enabled": True, "intervalMinutes": 15, "maxAgeMinutes": 45})
     swarm = config["swarm"]
@@ -171,6 +175,12 @@ def validate(config: dict) -> dict:
             raise ConfigError(f"swarm.{key} doit être entre {lo} et {hi}")
     if swarm["maxAgeMinutes"] < swarm["intervalMinutes"]:
         raise ConfigError("swarm.maxAgeMinutes doit être >= intervalMinutes")
+    # v1.33: quiet torrents (no leecher for hours) are read less often, up to this interval.
+    swarm.setdefault("maxIntervalMinutes", 240)
+    if type(swarm["maxIntervalMinutes"]) is not int or not 15 <= swarm["maxIntervalMinutes"] <= 1440:
+        raise ConfigError("swarm.maxIntervalMinutes doit être entre 15 et 1440")
+    if swarm["maxIntervalMinutes"] < swarm["intervalMinutes"]:
+        raise ConfigError("swarm.maxIntervalMinutes doit être >= intervalMinutes")
     cleanup = config["cleanup"]
     if not isinstance(cleanup, dict):
         raise ConfigError("cleanup doit être un objet")
@@ -254,6 +264,11 @@ def validate(config: dict) -> dict:
                 raise ConfigError(f"Règle {r['id']}: infohash d'exception invalide")
             if type(threshold) is not int or not 0 <= threshold <= 100000:
                 raise ConfigError(f"Règle {r['id']}: seuil individuel invalide pour {hash_[:12]}")
+        # v1.32: simulated upload allowed per day on this rule's trackers (GiB, 0 = none).
+        r.setdefault("dailyUploadCapGiB", 0)
+        cap = r["dailyUploadCapGiB"]
+        if type(cap) not in (int, float) or not math.isfinite(cap) or not 0 <= cap <= 100000:
+            raise ConfigError(f"Règle {r['id']}: dailyUploadCapGiB doit être compris entre 0 et 100000 Gio")
         r.setdefault("targetRatio", 0.0)
         ratio = r["targetRatio"]
         if type(ratio) not in (int, float) or not math.isfinite(ratio) or ratio < 0 or ratio > 100:

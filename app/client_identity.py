@@ -5,6 +5,7 @@ scraping), so private trackers see the same client as JOAL's sessions: peer_id p
 key format, query template, URL encoding and HTTP headers of the chosen profile.
 Unsupported profiles raise Unsupported; callers then keep the previous generic request.
 """
+import copy
 import json
 import re
 import secrets
@@ -166,6 +167,19 @@ class ClientIdentity:
                 part = part.replace(name, value)
             parts.append(part)
         return '&'.join(parts)
+
+    def borrowed(self, infohash, peer_id, key, port=None):
+        """Same profile, but the peer_id/key JOAL used for this torrent (v1.33): the
+        controller's stopped announce after a session comes from the same client."""
+        clone = copy.copy(self)
+        clone.peer_id = peer_id
+        clone._lock = threading.Lock()
+        clone._keys = dict(self._keys)
+        if key:
+            clone._keys[infohash] = key
+        if port:
+            clone.PORT = port
+        return clone
 
     def udp_identity(self, infohash):
         """peer_id bytes and 32-bit key for a BEP 15 announce."""

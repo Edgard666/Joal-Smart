@@ -2,7 +2,8 @@
 """Latest inputs of the image, for the weekly GitHub build.
 
 - JOAL: highest x.y.z tag of anthonyraymond/joal on Docker Hub, pinned by digest.
-- Java: eclipse-temurin 21 JDK/JRE (jammy), pinned by digest (security updates).
+- Java: eclipse-temurin 21 JDK (noble, reduced by jlink) and the ubuntu:24.04 base, pinned by
+  digest (security updates).
 - .client profiles: refreshed from the JOAL repository (its own automation adds the new
   qBittorrent versions there between releases) into ./clients before the build.
 - inputs: fingerprint of all of the above plus this repository's code. The workflow does
@@ -23,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 JOAL_REPO = 'https://github.com/anthonyraymond/joal.git'
 JOAL_TAGS = 'https://hub.docker.com/v2/repositories/anthonyraymond/joal/tags?page_size=100'
-BASES = {'jdk_image': 'eclipse-temurin:21-jdk-jammy', 'jre_image': 'eclipse-temurin:21-jre-jammy'}
+BASES = {'jdk_image': 'eclipse-temurin:21-jdk-noble', 'base_image': 'ubuntu:24.04'}
 
 
 def latest_version(names):
@@ -55,8 +56,8 @@ def clients_hash(folder):
     return h.hexdigest()
 
 
-def fingerprint(code_tree, joal_image, jdk_image, jre_image, profiles):
-    return hashlib.sha256('\n'.join((code_tree, joal_image, jdk_image, jre_image, profiles)).encode()).hexdigest()[:32]
+def fingerprint(code_tree, joal_image, jdk_image, base_image, profiles):
+    return hashlib.sha256('\n'.join((code_tree, joal_image, jdk_image, base_image, profiles)).encode()).hexdigest()[:32]
 
 
 def refresh_clients(target):
@@ -86,7 +87,7 @@ def main():
     count = refresh_clients(ROOT / 'clients')
     tree = subprocess.run(['git', 'rev-parse', 'HEAD^{tree}'], cwd=ROOT, capture_output=True, text=True,
                           check=True).stdout.strip()
-    values['inputs'] = fingerprint(tree, values['joal_image'], values['jdk_image'], values['jre_image'],
+    values['inputs'] = fingerprint(tree, values['joal_image'], values['jdk_image'], values['base_image'],
                                    clients_hash(ROOT / 'clients'))
     values['app_version'] = re.search(r'APP_VERSION = "([^"]+)"', (ROOT / 'app' / 'version.py').read_text()).group(1)
     values['profiles'] = str(count)

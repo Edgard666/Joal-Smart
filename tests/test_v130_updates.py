@@ -31,7 +31,7 @@ class BundledProfiles(unittest.TestCase):
     def test_image_ships_and_syncs_them(self):
         dockerfile = (ROOT / 'Dockerfile').read_text()
         self.assertIn('COPY clients/ /opt/joal/clients/', dockerfile)
-        for arg in ('JOAL_IMAGE', 'JDK_IMAGE', 'JRE_IMAGE'):
+        for arg in ('JOAL_IMAGE', 'JDK_IMAGE', 'BASE_IMAGE'):
             self.assertRegex(dockerfile, rf'ARG {arg}=\S+@sha256:[0-9a-f]{{64}}')   # local builds stay pinned
         self.assertIn('!clients/*.client', (ROOT / '.dockerignore').read_text())
         self.assertIn(' clients ', (ROOT / 'unraid' / 'update-joal.sh').read_text())

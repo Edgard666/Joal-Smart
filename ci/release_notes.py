@@ -2,7 +2,7 @@
 """Release notes for one published image: the CHANGELOG section of the app version
 plus the JOAL / Java / profiles it was built with.
 
-Usage: python3 ci/release_notes.py APP_VERSION JOAL_VERSION JRE_IMAGE PROFILES
+Usage: python3 ci/release_notes.py APP_VERSION JOAL_VERSION JDK_IMAGE PROFILES
 """
 import sys
 from pathlib import Path

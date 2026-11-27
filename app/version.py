@@ -1,2 +1,2 @@
 """Single source of truth for server and WebUI versions."""
-APP_VERSION = "1.31.1"
+APP_VERSION = "1.34.0"

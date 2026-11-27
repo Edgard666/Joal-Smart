@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import gzip
 import re
 import socket
 import struct
@@ -16,6 +15,9 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+import http.client
+import ssl
+import zlib
 from core import decode_bencode, domain, domain_matches
 
 # The public diagnostics API must never expose raw tracker URLs, query strings,
@@ -91,32 +93,111 @@ def address_allowed(text):
 
 
 def public_ip_only(host, port):
-    """Reject private, loopback, link-local, multicast and reserved tracker targets."""
+    """Reject private, loopback, link-local, multicast and reserved tracker targets.
+
+    Returns the first verified address; callers connect to that address only
+    (pinned_opener), so a second DNS answer cannot redirect the request
+    (DNS rebinding, v1.32)."""
     try:
         addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise ScrapeUnavailable('Résolution DNS du tracker impossible') from exc
     if not addrs or any(not address_allowed(item[4][0]) for item in addrs):
         raise ScrapeUnavailable('Adresse réseau du tracker non publique')
+    return addrs[0][4][0]
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    pinned_ip = None
+
+    def connect(self):
+        self.sock = socket.create_connection((self.pinned_ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    pinned_ip = None
+
+    def connect(self):
+        raw = socket.create_connection((self.pinned_ip, self.port), self.timeout)
+        # SNI and certificate check stay on the real host name.
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+
+def pinned_opener(host, ip):
+    """urllib opener whose TCP connection goes to `ip` while Host/SNI/certificate
+    use `host`. Redirects and proxies stay refused."""
+    http_cls = type('PinnedHTTP', (_PinnedHTTPConnection,), {'pinned_ip': ip})
+    https_cls = type('PinnedHTTPS', (_PinnedHTTPSConnection,), {'pinned_ip': ip})
+
+    class Plain(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            if (req.host or '').rsplit(':', 1)[0].strip('[]').lower() != host.lower():
+                raise ScrapeUnavailable('Redirection refusée')
+            return self.do_open(http_cls, req)
+
+    class Secure(urllib.request.HTTPSHandler):
+        def __init__(self):
+            super().__init__(context=ssl.create_default_context())
+
+        def https_open(self, req):
+            if (req.host or '').rsplit(':', 1)[0].strip('[]').lower() != host.lower():
+                raise ScrapeUnavailable('Redirection refusée')
+            return self.do_open(https_cls, req, context=self._context)
+
+    return urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}), Plain(), Secure())
+
+
+def bounded_gunzip(body, limit):
+    """Decompress gzip without letting a small bomb expand past `limit`."""
+    try:
+        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = inflater.decompress(body, limit + 1)
+    except zlib.error as exc:
+        raise ValueError('gzip invalide') from exc
+    if len(out) > limit or inflater.unconsumed_tail:
+        raise ScrapeUnavailable('Réponse du tracker trop grande')
+    return out
+
+
+# Set by main.py: callable(infohash) -> client_identity.ClientIdentity | None.
+# Scrapes then carry the same HTTP headers as the JOAL client profile (v1.32).
+SCRAPE_IDENTITY = None
+DEFAULT_SCRAPE_HEADERS = {'User-Agent': 'Mozilla/5.0', 'Accept': '*/*'}
+
+
+def scrape_headers(infohash):
+    if SCRAPE_IDENTITY is not None:
+        try:
+            identity = SCRAPE_IDENTITY(infohash)
+        except Exception:  # noqa: BLE001 - a profile problem must not break a scrape
+            identity = None
+        if identity is not None and identity.headers:
+            return dict(identity.headers)
+    return dict(DEFAULT_SCRAPE_HEADERS)
 
 
 def fetch_scrape(announce_url: str, infohash: str, *, opener=None, stats=False):
     """Return a fresh incomplete count, or raise. Never returns a guessed zero.
 
-    DNS is checked before the request; only use on administrator-approved
-    tracker domains. A changing DNS reply could still be a risk (DNS rebinding).
+    DNS is checked once and the connection goes to that verified address.
     """
     target = scrape_url(announce_url, infohash)
     parsed = urllib.parse.urlsplit(target)
     if opener is None:
-        public_ip_only(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
-        opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(target, headers={'User-Agent': 'JOAL-Smart-Cleanup/1.7', 'Accept': 'application/x-bittorrent'})
+        ip = public_ip_only(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+        opener = pinned_opener(parsed.hostname, ip)
+    req = urllib.request.Request(target, headers=scrape_headers(infohash))
     try:
         with opener.open(req, timeout=10) as res:
             if getattr(res, 'status', 200) != 200:
                 raise ScrapeUnavailable('Statut HTTP du scrape incorrect')
             body = res.read(MAX_RESPONSE + 1)
+            encoding = getattr(getattr(res, 'headers', None), 'get', lambda *_: '')('Content-Encoding', '') or ''
+            if encoding.lower() == 'gzip' and len(body) <= MAX_RESPONSE:
+                try:
+                    body = bounded_gunzip(body, MAX_RESPONSE)
+                except ValueError:
+                    raise ScrapeUnavailable('Scrape absent, incomplet ou non pris en charge') from None
     except urllib.error.HTTPError as exc:
         codes = {400, 401, 403, 404, 405, 429, 500, 502, 503, 504}
         descriptions = {400:'requête rejetée',401:'authentification requise',403:'accès refusé',
@@ -152,7 +233,7 @@ def fetch_scrape(announce_url: str, infohash: str, *, opener=None, stats=False):
 
 
 
-def fetch_udp_scrape(announce_url: str, infohash: str, *, timeout=UDP_TIMEOUT, resolver=None, socket_factory=None, stats=False, stopped_left=None, presence=None, udp_identity=None):
+def fetch_udp_scrape(announce_url: str, infohash: str, *, timeout=UDP_TIMEOUT, resolver=None, socket_factory=None, stats=False, stopped_left=None, presence=None, udp_identity=None, udp_port=None):
     """BEP 15 connect + scrape only. No announce or peer registration.
 
     Strict response checks prevent mismatched or truncated UDP packets being
@@ -197,7 +278,7 @@ def fetch_udp_scrape(announce_url: str, infohash: str, *, timeout=UDP_TIMEOUT, r
                                                 else (secrets.token_bytes(20), secrets.randbits(32), 'stopped'))
                 event_id = {'started': 2, 'stopped': 3, '': 0}[event]
                 packet = struct.pack('!QII20s20sQQQIIIiH', connection_id, 1, txn, bytes.fromhex(infohash),
-                                     peer, 0, stopped_left, 0, event_id, 0, key, 0, 49152 if udp_identity else 6881)
+                                     peer, 0, stopped_left, 0, event_id, 0, key, 0, (udp_port or 49152) if udp_identity else 6881)
                 path = (parsed.path + ('?' + parsed.query if parsed.query else '')).encode('ascii')
                 for start in range(0, len(path), 255):
                     chunk = path[start:start + 255]
@@ -233,6 +314,121 @@ def fetch_udp_scrape(announce_url: str, infohash: str, *, timeout=UDP_TIMEOUT, r
         raise ScrapeUnavailable('Délai de réponse du tracker dépassé') from exc
     except (OSError, struct.error, ValueError, OverflowError) as exc:
         raise ScrapeUnavailable('Tracker UDP inaccessible (scrape)') from exc
+
+
+MULTI_MAX_HTTP = 50          # info_hash parameters per request (URL length stays < 4 KiB)
+MULTI_MAX_UDP = 70           # BEP 15: 8 + 12 * 70 bytes answer, well under one packet
+
+
+def _stats(record):
+    if not isinstance(record, dict):
+        return None
+    leechers, seeders = record.get(b'incomplete'), record.get(b'complete')
+    leechers = leechers if type(leechers) is int and leechers >= 0 else None
+    seeders = seeders if type(seeders) is int and seeders >= 0 else None
+    return None if leechers is None and seeders is None else {'leechers': leechers, 'seeders': seeders}
+
+
+def fetch_scrape_many(announce_url, infohashes, *, opener=None):
+    """One scrape request for several torrents of the same tracker (BEP 48 / BEP 15), as
+    Transmission does (v1.33). Returns {infohash: {'leechers', 'seeders'}} for the torrents
+    the tracker answered; missing torrents are simply absent (the caller asks them alone).
+    Raises ScrapeUnavailable when the tracker refuses the grouped form."""
+    hashes = [h.lower() for h in dict.fromkeys(infohashes) if re.fullmatch(r'[0-9a-fA-F]{40}', h)]
+    if not hashes:
+        return {}
+    scheme = urllib.parse.urlsplit(announce_url).scheme.lower()
+    if scheme == 'udp':
+        return _fetch_udp_many(announce_url, hashes[:MULTI_MAX_UDP])
+    if scheme not in ('http', 'https'):
+        raise ScrapeUnavailable('Protocole du tracker non pris en charge')
+    hashes = hashes[:MULTI_MAX_HTTP]
+    first = scrape_url(announce_url, hashes[0])
+    extra = ''.join('&info_hash=' + urllib.parse.quote_from_bytes(bytes.fromhex(h), safe='') for h in hashes[1:])
+    target = first + extra
+    parsed = urllib.parse.urlsplit(target)
+    if opener is None:
+        ip = public_ip_only(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+        opener = pinned_opener(parsed.hostname, ip)
+    try:
+        with opener.open(urllib.request.Request(target, headers=scrape_headers(hashes[0])), timeout=10) as res:
+            if getattr(res, 'status', 200) != 200:
+                raise ScrapeUnavailable('Statut HTTP du scrape incorrect')
+            body = res.read(MAX_RESPONSE + 1)
+            encoding = getattr(getattr(res, 'headers', None), 'get', lambda *_: '')('Content-Encoding', '') or ''
+            if encoding.lower() == 'gzip' and len(body) <= MAX_RESPONSE:
+                body = bounded_gunzip(body, MAX_RESPONSE)
+    except urllib.error.HTTPError as exc:
+        raise ScrapeUnavailable('Tracker inaccessible (scrape)') from exc
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        raise ScrapeUnavailable('Tracker inaccessible (scrape)') from exc
+    if len(body) > MAX_RESPONSE:
+        raise ScrapeUnavailable('Réponse du tracker trop grande')
+    try:
+        payload, end = decode_bencode(body)
+        files = payload[b'files'] if end == len(body) and isinstance(payload, dict) else None
+        if not isinstance(files, dict):
+            raise ValueError
+    except (ValueError, KeyError, IndexError, TypeError, RecursionError) as exc:
+        raise ScrapeUnavailable('Scrape absent, incomplet ou non pris en charge') from exc
+    result = {}
+    for h in hashes:
+        stats = _stats(files.get(bytes.fromhex(h)))
+        if stats is not None:
+            result[h] = stats
+    return result
+
+
+def _fetch_udp_many(announce_url, hashes, *, resolver=None, socket_factory=None, timeout=UDP_TIMEOUT):
+    parsed = urllib.parse.urlsplit(announce_url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ScrapeUnavailable('Tracker UDP invalide')
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ScrapeUnavailable('Port UDP invalide') from exc
+    if not port:
+        raise ScrapeUnavailable('Port UDP manquant')
+    resolver = resolver or socket.getaddrinfo
+    socket_factory = socket_factory or socket.socket
+    try:
+        addresses = resolver(parsed.hostname, port, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
+    except (OSError, ValueError) as exc:
+        raise ScrapeUnavailable('Résolution DNS du tracker UDP impossible') from exc
+    if not addresses or any(not address_allowed(address[4][0]) for address in addresses):
+        raise ScrapeUnavailable('Adresse réseau du tracker UDP non publique')
+    family, kind, proto, _, destination = addresses[0]
+    try:
+        with socket_factory(family, kind, proto) as conn:
+            conn.settimeout(timeout)
+            conn.connect(destination)
+            txn = secrets.randbits(32)
+            conn.sendall(struct.pack('!QII', UDP_PROTOCOL_ID, 0, txn))
+            response = conn.recv(2048)
+            if len(response) != 16:
+                raise ScrapeUnavailable('Réponse UDP connect invalide')
+            action, echoed, connection_id = struct.unpack('!IIQ', response)
+            if action != 0 or echoed != txn:
+                raise ScrapeUnavailable('Réponse UDP connect invalide')
+            txn = secrets.randbits(32)
+            conn.sendall(struct.pack('!QII', connection_id, 2, txn) + b''.join(bytes.fromhex(h) for h in hashes))
+            response = conn.recv(8 + 12 * len(hashes) + 64)
+            if len(response) >= 8 and struct.unpack('!I', response[:4])[0] == 3:
+                raise ScrapeUnavailable('Tracker UDP : réponse d’erreur')
+            if len(response) != 8 + 12 * len(hashes) or struct.unpack('!II', response[:8]) != (2, txn):
+                raise ScrapeUnavailable('Réponse UDP scrape absente ou invalide')
+    except ScrapeUnavailable:
+        raise
+    except (OSError, struct.error, ValueError, OverflowError) as exc:
+        raise ScrapeUnavailable('Tracker UDP inaccessible (scrape)') from exc
+    result = {}
+    for index, h in enumerate(hashes):
+        complete, _downloaded, incomplete = struct.unpack('!III', response[8 + 12 * index:20 + 12 * index])
+        stats = {'leechers': None if incomplete == 0xffffffff else incomplete,
+                 'seeders': None if complete == 0xffffffff else complete}
+        if stats['leechers'] is not None or stats['seeders'] is not None:
+            result[h] = stats
+    return result
 
 
 def fetch_tracker_scrape(announce_url: str, infohash: str) -> int:
@@ -312,7 +508,8 @@ def zero_transfer_announce(url, infohash, left, presence=None, identity=None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme == 'udp':
         return fetch_udp_scrape(url, infohash, stopped_left=left, presence=presence,
-                                udp_identity=identity.udp_identity(infohash) if identity else None)
+                                udp_identity=identity.udp_identity(infohash) if identity else None,
+                                udp_port=identity.PORT if identity else None)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None:
         raise ScrapeUnavailable('Tracker HTTP(S) non pris en charge')
     peer, key, event = presence or (secrets.token_bytes(20), None, 'stopped')
@@ -333,10 +530,10 @@ def zero_transfer_announce(url, infohash, left, presence=None, identity=None):
         names = {*params, 'event'}
     if existing.intersection(names):
         raise ScrapeUnavailable('Annonce d’arrêt sans compteurs')
-    public_ip_only(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
+    ip = public_ip_only(parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80))
     query = (parsed.query + '&' if parsed.query else '') + added
     target = parsed._replace(query=query, fragment='').geturl()
-    opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
+    opener = pinned_opener(parsed.hostname, ip)
     try:
         request = urllib.request.Request(target, headers=headers) if headers else target
         with opener.open(request, timeout=10) as response:
@@ -344,8 +541,8 @@ def zero_transfer_announce(url, infohash, left, presence=None, identity=None):
             encoding = getattr(getattr(response, 'headers', None), 'get', lambda *_: '')('Content-Encoding', '') or ''
             if headers and encoding.lower() == 'gzip' and len(body) <= MAX_RESPONSE:
                 try:
-                    body = gzip.decompress(body)[:MAX_RESPONSE + 1]
-                except (OSError, EOFError):
+                    body = bounded_gunzip(body, MAX_RESPONSE)
+                except ValueError:
                     raise ScrapeUnavailable('Annonce d’arrêt sans compteurs') from None
     except urllib.error.HTTPError as exc:
         if not presence:

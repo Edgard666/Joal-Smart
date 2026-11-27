@@ -32,7 +32,9 @@ with sync_playwright() as playwright:
     assert page.locator('#login-password').get_attribute('type') == 'password'
     page.get_by_role('button',name='Se connecter').click()
     page.wait_for_function('window.__loginCalls.length === 1')
-    assert page.locator('#login-error').is_visible()
+    # v1.32: the 401 body is read (double authentification) before the message is shown.
+    page.wait_for_selector('#login-error', state='visible')
+    assert page.locator('#totp-field').is_hidden()
     assert page.locator('#login-password').input_value() == ''
     page.locator('#login-error').evaluate('el=>el.hidden=true')
     page.screenshot(path=os.path.join(os.getenv('SCREENSHOT_DIR', tempfile.gettempdir()), 'joal-v112-login-preview.png'),full_page=True)

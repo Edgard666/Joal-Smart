@@ -18,13 +18,25 @@ import time
 from pathlib import Path
 
 from core import domain, domain_matches
-from tracker_scrape import fetch_tracker_stats, import_announce_stats, observed_scrapes, ScrapeUnavailable, safe_scrape_error
+from tracker_scrape import fetch_tracker_stats, fetch_scrape_many, import_announce_stats, observed_scrapes, ScrapeUnavailable, safe_scrape_error
 
 HASH = re.compile(r'^[0-9a-f]{40}$')
 FORCED_MIN_GAP = 60  # seconds: anti-hammering for repeated manual mode changes
 PEER_LOG_EVERY = 900  # seconds between two identical announce points
 HISTORY_LIMIT = 1344  # approx. 14 days at a 15-minute interval
 HISTORY_AGE = 14 * 86400
+MULTI_RETRY = 86400   # a tracker that refused a grouped scrape is asked one by one for a day
+
+
+def quiet_factor(quiet_seconds):
+    """How much longer to wait between two readings of a torrent without leechers (v1.33)."""
+    if quiet_seconds < 3600:
+        return 1
+    if quiet_seconds < 6 * 3600:
+        return 2
+    if quiet_seconds < 24 * 3600:
+        return 4
+    return 8
 
 class SwarmMonitor:
     def __init__(self, path, now=time.time):
@@ -36,6 +48,9 @@ class SwarmMonitor:
         self.forced_refresh = set()  # hashes to scrape now, ignoring the usual interval
         # infohash -> client_identity.ClientIdentity (or None) for the controller's stopped announces.
         self.identity_for = None
+        self.adaptive = (None, None)  # (base, cap) of the last refresh: extends freshness
+        self.multi_refused = {}     # tracker host -> time a grouped scrape was refused
+        self.requests_made = 0      # network requests of the last refresh (diagnostics, tests)
         self.entries = {}
         if self.path.exists():
             try:
@@ -204,6 +219,8 @@ class SwarmMonitor:
             for h, record in self.entries.items():
                 samples = [o.get('sampledAt') for o in record.get('observations', {}).values()
                            if isinstance(o, dict) and isinstance(o.get('sampledAt'), (int, float))]
+                if samples and max(samples) >= self.now() - self.validity(h, max_age_seconds):
+                    continue          # a quiet torrent read less often is not stale (v1.33)
                 if not samples or max(samples) < cutoff:
                     result.add(h)
             return result
@@ -222,7 +239,38 @@ class SwarmMonitor:
             self.save()
         return True
 
-    def refresh(self, rules, *, max_checks=20, min_age=900, fetch=None, overrides=None, on_sample=None, import_probe=None):
+    def due_age(self, record, rid, base, cap):
+        """Adaptive interval (v1.33): a torrent that has shown no leecher for a long time is
+        read less often (×2 after 1 h, ×4 after 6 h, ×8 after 24 h), never beyond `cap`.
+        The first leecher seen brings it back to the normal interval."""
+        if not cap or cap <= base:
+            return base
+        points = [p for p in record.get('history', {}).get(rid, [])
+                  if isinstance(p, dict) and isinstance(p.get('time'), (int, float)) and type(p.get('leechers')) is int]
+        if len(points) < 4:
+            return base
+        busy = [p['time'] for p in points if p['leechers'] > 0]
+        since = max(busy) if busy else min(p['time'] for p in points)
+        return min(cap, base * quiet_factor(self.now() - since))
+
+    def validity(self, infohash, max_age_seconds, rid=None):
+        """How long a reading stays usable: the normal validity, plus the extra waiting
+        time of a quiet torrent, so it is not shown as « trop ancien » between two
+        spaced readings (v1.33)."""
+        base, cap = self.adaptive
+        if not base or not cap:
+            return max_age_seconds
+        with self.lock:
+            record = self.entries.get(infohash, {})
+            rids = [rid] if rid else list(record.get('observations', {})) or [None]
+            extra = max((self.due_age(record, r, base, cap) - base) if r else 0 for r in rids)
+        return max_age_seconds + max(0, extra)
+
+    def refresh(self, rules, *, max_checks=20, min_age=900, fetch=None, overrides=None, on_sample=None,
+                import_probe=None, max_age=None, joal_peers=None, pause=None):
+        """`max_age`: longest adaptive interval (seconds). `joal_peers(h)`: fresh counts from a
+        running JOAL session ({'leechers', 'seeders', 'time'}) -> no tracker request at all.
+        `pause()`: called between two network requests, to spread them (v1.33)."""
         """Refresh the least-recently checked torrent/rule pairs first.
 
         Earlier versions visited the first 20 infohashes at every interval,
@@ -231,6 +279,7 @@ class SwarmMonitor:
         """
         if not isinstance(rules, list):
             return 0
+        self.adaptive = (min_age, max_age)
         jobs = []
         overrides = overrides or {}
         now = self.now()
@@ -262,7 +311,8 @@ class SwarmMonitor:
                     old = record.get('observations', {}).get(rid, {})
                     checked_at = old.get('attemptedAt')
                     if isinstance(checked_at, (int, float)) and now - checked_at < (
-                            FORCED_MIN_GAP if h in self.forced_refresh else min_age):
+                            FORCED_MIN_GAP if h in self.forced_refresh
+                            else self.due_age(record, rid, min_age, max_age)):
                         continue
                     priority = checked_at if isinstance(checked_at, (int, float)) else float('-inf')
                     jobs.append((priority, h, rid, matches, effective_rule))
@@ -271,7 +321,8 @@ class SwarmMonitor:
                     # Imported metadata can be observed without selecting a simulation rule.
                     rid = ':import'
                     last = record.get('observations', {}).get(rid, {}).get('attemptedAt')
-                    if last is None or now - last >= (FORCED_MIN_GAP if h in self.forced_refresh else min_age):
+                    if last is None or now - last >= (FORCED_MIN_GAP if h in self.forced_refresh
+                                                      else self.due_age(record, rid, min_age, max_age)):
                         targets = remaining
                         scope = {'enabled': True, 'trackerDomains': [domain(url) for url in targets]}
                         jobs.append((last if last is not None else float('-inf'), h, rid, targets, scope))
@@ -281,17 +332,92 @@ class SwarmMonitor:
             # A forced request with nothing due (checked < FORCED_MIN_GAP ago) is satisfied.
             self.forced_refresh.difference_update(self.forced_refresh - due)
         jobs.sort(key=lambda job: (job[1] not in urgent, job[0], job[1], job[2]))
+        selected_jobs = jobs[:max_checks]
+        requests = [0]
+        self.requests_made = 0
+
+        def before_request():
+            if requests[0] and pause is not None:
+                pause()
+            requests[0] += 1
+            self.requests_made = requests[0]
+
+        # Counts already given by a running JOAL session: no tracker request (v1.33).
+        from_joal = {}
+        if joal_peers is not None:
+            for _, h, rid, _, _ in selected_jobs:
+                if h not in urgent and h not in from_joal:
+                    peers = joal_peers(h)
+                    if peers:
+                        from_joal[h] = peers
+        # Grouped scrapes: one request per tracker URL for several torrents (v1.33).
+        cache = {}
+        if fetch is None:
+            by_url = {}
+            for _, h, rid, matches, _ in selected_jobs:
+                if h in from_joal:
+                    continue
+                for url in matches:
+                    by_url.setdefault(url, set()).add(h)
+            for url, hashes in sorted(by_url.items()):
+                host = domain(url)
+                if len(hashes) < 2 or now - self.multi_refused.get(host, -MULTI_RETRY) < MULTI_RETRY:
+                    continue
+                before_request()
+                try:
+                    for h, stats in fetch_scrape_many(url, sorted(hashes)).items():
+                        cache[(url, h)] = stats
+                except (ScrapeUnavailable, OSError, ValueError):
+                    self.multi_refused[host] = now
+
+        def network_fetch(url, infohash):
+            hit = cache.pop((url, infohash), None)
+            if hit is not None:
+                return hit
+            before_request()
+            return (fetch or fetch_tracker_stats)(url, infohash)
+
         attempted = 0
-        for _, h, rid, matches, rule in jobs[:max_checks]:
+        try:
+            attempted = self._run_jobs(selected_jobs, urgent, solo_hashes, from_joal, network_fetch,
+                                       before_request, import_probe, on_sample)
+        finally:
+            self.save()
+        with self.lock:
+            self.pending_imports.difference_update(urgent - {job[1] for job in jobs[attempted:]})
+            self.forced_refresh.difference_update({job[1] for job in jobs[:attempted]})
+        return attempted
+
+    def _run_jobs(self, selected_jobs, urgent, solo_hashes, from_joal, network_fetch, before_request,
+                  import_probe, on_sample):
+        attempted = 0
+        for _, h, rid, matches, rule in selected_jobs:
             with self.lock:
                 if self.pending_imports - urgent:
                     break  # A newer import arrived while a tracker request was running.
             attempted += 1
             tick = self.now()
+            if h in from_joal:
+                peers = from_joal[h]
+                observation = {'attemptedAt': tick, 'sampledAt': peers['time'],
+                               'leechers': peers.get('leechers'), 'seeders': peers.get('seeders'),
+                               'trackerCount': 1, 'successCount': 1, 'status': 'ok',
+                               'source': peers.get('source', 'Annonces JOAL'), 'trackerDiagnostics': {}}
+                with self.lock:
+                    current = self.entries.get(h)
+                    if current is not None:
+                        current.setdefault('observations', {})[rid] = observation
+                        history = current.setdefault('history', {}).setdefault(rid, [])
+                        history.append({'time': tick, 'leechers': observation['leechers'],
+                                        'seeders': observation['seeders'], 'status': 'ok',
+                                        'successCount': 1, 'trackerCount': 1})
+                        current['history'][rid] = [p for p in history if isinstance(p, dict)
+                                                   and p.get('time', 0) >= tick - HISTORY_AGE][-HISTORY_LIMIT:]
+                continue
             try:
                 matching = [{'url': url} for url in matches]
                 source = 'scrape HTTP(S)/UDP'
-                read_stats = fetch or fetch_tracker_stats
+                read_stats = network_fetch
                 def import_stats(url, infohash):
                     nonlocal source
                     standalone = infohash in solo_hashes
@@ -320,6 +446,7 @@ class SwarmMonitor:
                     with self.lock:
                         size = self.entries.get(infohash, {}).get('sizeBytes')
                     identity = self.identity_for(infohash) if self.identity_for else None
+                    before_request()
                     try:
                         # v1.29.4: same client identity as the JOAL sessions when a profile exists.
                         result = (import_announce_stats(url, infohash, size, identity=identity) if identity
@@ -335,7 +462,7 @@ class SwarmMonitor:
                 probe = import_probe and (h in urgent or h in solo_hashes) and rid != ':import'
                 amount, successful, expected, tracker_details, error_details, seeders, tracker_seeds = observed_scrapes(
                     matching, [rule], h, details=True, diagnostics=True, stats_details=True,
-                    fetch=import_stats if probe else fetch, max_urls=32 if h in solo_hashes else 8)
+                    fetch=import_stats if probe else network_fetch, max_urls=32 if h in solo_hashes else 8)
                 observation = {'attemptedAt': tick,
                                'sampledAt': tick if successful or seeders is not None else None,
                                'leechers': amount if successful else None,
@@ -376,12 +503,9 @@ class SwarmMonitor:
                     current['history'][rid] = [point for point in history
                                                if isinstance(point, dict) and isinstance(point.get('time'), (int, float))
                                                and point['time'] >= tick - HISTORY_AGE][-HISTORY_LIMIT:]
-            self.save()
             if on_sample is not None and h in urgent:
+                self.save()
                 on_sample()
-        with self.lock:
-            self.pending_imports.difference_update(urgent - {job[1] for job in jobs[attempted:]})
-            self.forced_refresh.difference_update({job[1] for job in jobs[:attempted]})
         return attempted
 
     def snapshot(self, max_age_seconds=3600, *, limit=1000):
@@ -393,7 +517,10 @@ class SwarmMonitor:
                 observations = {}
                 for rule, o in item.get('observations', {}).items():
                     sampled = o.get('sampledAt')
-                    fresh = isinstance(sampled, (int, float)) and 0 <= now - sampled <= max_age_seconds
+                    limit = max_age_seconds
+                    if self.adaptive[0] and self.adaptive[1]:
+                        limit += max(0, self.due_age(item, rule, *self.adaptive) - self.adaptive[0])
+                    fresh = isinstance(sampled, (int, float)) and 0 <= now - sampled <= limit
                     observations[rule] = {
                         'leechers': o.get('leechers') if fresh and type(o.get('leechers')) is int else None,
                         'seeders': o.get('seeders') if fresh and type(o.get('seeders')) is int else None,

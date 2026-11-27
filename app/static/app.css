@@ -359,3 +359,10 @@ input[type=file]::file-selector-button:hover{background:#22384f}
 .whats-new-version li{margin:4px 0;line-height:1.45}
 .link-button{background:none;border:0;padding:0;color:inherit;font:inherit;text-decoration:underline;cursor:pointer}
 .link-button:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+/* v1.32 : sécurité du compte, widget, plafond */
+.settings-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:12px 0}
+.settings-actions label{display:flex;flex-direction:column;gap:7px;color:#afc4da;font-weight:650;font-size:12px}
+.copy-box{white-space:pre-wrap;word-break:break-all;user-select:all;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0e192a;border:1px solid #374b61;border-radius:8px;padding:10px 12px;margin:8px 0}
+#security-panel h3{font-size:15px;margin:22px 0 6px}
+#totp-setup label{display:flex;flex-direction:column;gap:7px;max-width:280px;font-size:12px;font-weight:650}
+[hidden]{display:none!important}

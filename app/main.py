@@ -7,9 +7,12 @@ import sys
 import sqlite3
 import qbit_settings
 import alerts
+import admin_account
+import widget_token
 import changelog
 import client_identity
 import tracker_stats
+import tracker_scrape
 import interface_design
 import upload_history
 import import_watch
@@ -17,11 +20,13 @@ import log_rotation
 from collections import deque
 import copy
 import datetime as dt
+import gzip
 import hashlib
 import ipaddress
 import json
 import logging
 import os
+import random
 import re
 from pathlib import Path
 import shutil
@@ -90,7 +95,10 @@ def _joal_java_opts(payload_bytes=0):
     override = os.environ.get("JOAL_JAVA_OPTS", "").split()
     if override:
         return override
+    # v1.33, measured on the real JOAL: one fast compiler only, smaller code cache and thread
+    # stacks: 183 -> 155 MiB per session and 6.5 -> 3.5 s of CPU to start.
     return [f"-Xmx{joal_heap_mb(payload_bytes)}m", "-XX:+UseSerialGC", "-XX:MaxMetaspaceSize=96m",
+            "-XX:TieredStopAtLevel=1", "-XX:CICompilerCount=1", "-XX:ReservedCodeCacheSize=24m", "-Xss256k",
             "-XX:+ExitOnOutOfMemoryError"]
 
 
@@ -127,7 +135,9 @@ STATS = None               # tracker_stats.TrackerStats (v1.31)
 SOLO_LIBRARY = None
 SOLO_REVISION = 0
 SOLO_EDIT_LOCK = threading.RLock()
-AUTH = SessionManager(lambda: PASSWORD)
+ACCOUNT = admin_account.Account(DATA, clear_password=lambda: PASSWORD)
+AUTH = SessionManager(lambda: PASSWORD, checker=lambda password: ACCOUNT.check_password(password),
+                      second_factor=lambda: ACCOUNT.check_totp if ACCOUNT.totp_enabled() else None)
 ACTIVE_HASHES = {}  # hashes currently assigned to each running JOAL process
 
 STATUS = {"time": None, "inventoryTime": None, "evaluationTime": None,
@@ -316,6 +326,7 @@ def apply_qbit_connection():
     POLL_NOW.set()
     SOLO_NOW.set()
     CLEANUP_NOW.set()
+    GUARD_FULL_NOW.set()
 
 
 def wait_torrent_state(client, config, h, done, attempts=6, delay=1.0):
@@ -399,7 +410,8 @@ def health_snapshot():
             'qbitConnected': bool(snapshot.get('qbitConnected')), 'lastInventoryAt': last_update,
             'inventoryAgeSeconds': age, 'lastEvaluationAt': snapshot.get('evaluationTime'),
             'lastErrorPresent': bool(snapshot.get('error')), 'dryRun': bool(snapshot.get('dryRun')),
-            'joalProcesses': running, 'activeProcesses': len(running),
+            'joalProcesses': running,
+            'activeProcesses': len({id(proc) for proc in RUNNERS.values() if proc is not None and proc.poll() is None}),
             'trackerMonitorLastAt': snapshot.get('swarm', {}).get('updatedAt'),
             'trackerMonitorCount': snapshot.get('swarm', {}).get('count', 0),
             'joalTransferCounterAvailable': False}
@@ -413,6 +425,20 @@ def runner_stop(rule_id):
     Caller must hold RUNNER_LOCK.
     """
     proc = RUNNERS.get(rule_id)
+    parts = getattr(proc, 'parts', None)
+    if (proc is not None and isinstance(parts, set) and proc.poll() is None
+            and any(RUNNERS.get(key) is proc for key in parts - {rule_id})):
+        # Shared JVM (v1.33): only this part's torrents leave; JOAL announces their stop.
+        save_final_volumes(rule_id, proc)
+        for h in ACTIVE_HASHES.get(rule_id, set()):
+            (proc.root / "torrents" / (h + ".torrent")).unlink(missing_ok=True)
+            proc.payload_sizes.pop(h, None)
+        parts.discard(rule_id)
+        ACTIVE_HASHES.pop(rule_id, None)
+        RUNNERS.pop(rule_id, None)
+        safe_audit('stop_rule', rule_id)
+        LOG.info("JOAL %s : torrents retirés de la session partagée", rule_id)
+        return
     if proc is not None and rule_id.startswith('solo-') and SWARM_MONITOR is not None:
         try:
             live_joal_upload()
@@ -433,6 +459,13 @@ def runner_stop(rule_id):
     if proc is not None:
         save_final_volumes(rule_id, proc)
         safe_audit('stop_rule', rule_id)
+        parts = getattr(proc, 'parts', None)
+        for key in sorted(parts) if isinstance(parts, set) else ():
+            # An exited shared JVM ends the partner's assignment too.
+            if key != rule_id and RUNNERS.get(key) is proc:
+                save_final_volumes(key, proc)
+                ACTIVE_HASHES.pop(key, None)
+                RUNNERS.pop(key, None)
     ACTIVE_HASHES.pop(rule_id, None)
     RUNNERS.pop(rule_id, None)
 
@@ -514,6 +547,56 @@ def idle_assignments(config):
     return {h for h, rid in config.get('torrentRuleOverrides', {}).items() if rid in idle_ids}
 
 
+_CAP_CACHE = {}
+WIDGET_LOCK = threading.Lock()
+WIDGET_FAILURES = {}
+
+
+def widget_summary():
+    """Figures for Homepage/Homarr/Home Assistant: no names, hashes or tracker URLs."""
+    with STATE_LOCK:
+        rate = UPLOAD_HISTORY[-1][1] if UPLOAD_HISTORY else None
+        qbit = bool(STATUS.get('qbitConnected'))
+    with RUNNER_LOCK:
+        alive = [rid for rid, proc in RUNNERS.items() if proc is not None and proc.poll() is None]
+        torrents = sum(len(ACTIVE_HASHES.get(rid, ())) for rid in alive)
+    today = STATS.summary(7)['totals']['today'] if STATS is not None else None
+    return {'version': APP_VERSION, 'joalVersion': JOAL_VERSION, 'qbitConnected': qbit,
+            'paused': simulations_paused(), 'activeSessions': len(alive), 'activeTorrents': torrents,
+            'uploadBytesPerSecond': rate, 'uploadKiBps': None if rate is None else round(rate / 1024, 1),
+            'uploadedTodayBytes': today, 'uploadedTodayGiB': None if today is None else round(today / 2 ** 30, 2),
+            'time': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}
+
+
+def cap_reason(rule, now=None):
+    """'Plafond du jour atteint (…)' when the rule's daily cap is used up (v1.32), else None.
+    Forced sessions are exempt. Computed at most every 5 s per rule."""
+    cap = rule.get('dailyUploadCapGiB') or 0
+    if not cap or STATS is None or rule.get('id') in FORCED_IDS:
+        return None
+    now = time.monotonic() if now is None else now
+    cached = _CAP_CACHE.get(rule['id'])
+    if cached and cached[0] == cap and now - cached[1] < 5:
+        used = cached[2]
+    else:
+        patterns = list(rule.get('trackerDomains') or [])
+        used = STATS.bytes_today(lambda d: any(domain_matches(d, p) for p in patterns))
+        _CAP_CACHE[rule['id']] = (cap, now, used)
+    if used < cap * 2 ** 30:
+        return None
+    return f'Plafond du jour atteint ({used / 2 ** 30:.1f} / {cap:g} Gio)'.replace('.', ',')
+
+
+def rule_open(rule):
+    """Inside its time window and below its daily cap."""
+    return rule_active_now(rule) and cap_reason(rule) is None
+
+
+def closed_reason(rule):
+    return (cap_reason(rule) if rule_active_now(rule)
+            else 'Hors plage horaire (' + schedule_label(rule) + ')')
+
+
 def simulation_config(config):
     with RUNNER_LOCK:
         modes = TORRENT_MODES
@@ -527,7 +610,7 @@ def simulation_config(config):
         profile = next((r for r in profiles if r['enabled']), profiles[0])
         rules.append(dict(profile, id=FORCED_RULE, enabled=True, trackerDomains=[], minLeechers=0,
                           minLeechersByHash={}, targetRatio=0, simultaneousSeed=config['maxCandidates'],
-                          schedule=None))  # Forced ignores time windows
+                          schedule=None, dailyUploadCapGiB=0))  # Forced ignores time windows and caps
     if FORCED_IDLE in forced.values():
         rules.append(dict(id=FORCED_IDLE, enabled=True, trackerDomains=[], minLeechers=0,
                           minLeechersByHash={}, targetRatio=0, simultaneousSeed=config['maxCandidates'],
@@ -590,9 +673,17 @@ def presence_profile(rule):
 _IDENTITY_WARNED = set()
 
 
-def probe_identity(_infohash=None):
+def probe_identity(infohash=None):
     """Client identity for the controller's stopped announces: the profile JOAL would use
-    for a zero-rate session (first enabled rule with a .client). None -> generic request."""
+    for a zero-rate session (first enabled rule with a .client). None -> generic request.
+    v1.33: a torrent that was in a JOAL session reuses that session's profile, peer_id and key."""
+    previous = JOAL_IDENTITIES.get(infohash) if infohash else None
+    if previous:
+        try:
+            return client_identity.load(DATA / 'clients' / previous['client']).borrowed(
+                infohash, previous['peer'], previous['key'], previous.get('port'))
+        except (OSError, client_identity.Unsupported):
+            pass
     name = presence_profile({'client': None})
     if not name:
         return None
@@ -603,6 +694,151 @@ def probe_identity(_infohash=None):
             _IDENTITY_WARNED.add(name)
             LOG.warning('Profil %s non reproductible pour les relevés (%s) : requête générique', name, exc)
         return None
+
+
+_FILTERED = {}   # (infohash, urls, file signature) -> .torrent limited to the rule's trackers
+
+
+def filtered_solo_payload(info, urls, h):
+    """filter_torrent() of an imported torrent, computed once per file version and tracker
+    set instead of at every 10-second pass (v1.33)."""
+    key = (h, tuple(urls), info.get('signature'))
+    cached = _FILTERED.get(key)
+    if cached is None:
+        blob = info['payload'] if 'payload' in info else SOLO_LIBRARY.payload(info)
+        cached = filter_torrent(blob, urls, h)
+        stale = [k for k in _FILTERED if k[0] == h]          # older versions of this torrent
+        for k in stale:
+            _FILTERED.pop(k, None)
+        if sum(len(v) for v in _FILTERED.values()) + len(cached) > 256 * 2 ** 20:
+            _FILTERED.clear()
+        _FILTERED[key] = cached
+    return cached
+
+
+def _telemetry_dir():
+    folder = Path("/dev/shm")
+    return str(folder) if folder.is_dir() and os.access(folder, os.W_OK | os.X_OK) else None
+
+
+TELEMETRY_DIR = _telemetry_dir()
+
+
+def joal_seed_slots(rule):
+    return max(1, min(2000, 2 * int(rule.get("simultaneousSeed") or 1)))
+
+
+def joal_config_key(rule):
+    """What JOAL reads once at start-up: a change needs a new JVM (v1.33)."""
+    presence_only = rule["minUploadRate"] == rule["maxUploadRate"] == 0
+    client = presence_profile(rule) if presence_only else rule.get("client")
+    return json.dumps([rule["minUploadRate"], rule["maxUploadRate"], client, joal_seed_slots(rule), announced_port()])
+
+
+def joal_heap_limit(java_opts):
+    """Heap of a started JVM in MiB; unknown (JOAL_JAVA_OPTS without -Xmx) = no limit."""
+    for option in java_opts:
+        match = re.fullmatch(r"-Xmx(\d+)([mMgG])", option)
+        if match:
+            return int(match.group(1)) * (1024 if match.group(2) in "gG" else 1)
+    return float("inf")
+
+
+def _partner_id(rid):
+    return rid[5:] if rid.startswith("solo-") else "solo-" + rid
+
+
+def _write_session_torrent(folder, infohash, payload):
+    target = folder / (infohash + ".torrent")
+    temp = folder / ("." + infohash + ".tmp")          # JOAL only watches *.torrent
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(payload)
+    os.replace(temp, target)
+
+
+def runner_hot_update(rule, selected, recheck=None):
+    """Change the torrents of a running JOAL without restarting it (v1.33).
+
+    JOAL watches its torrents folder: a new file is announced (started) within ~5 s, a
+    removed file sends one stopped announce. The other torrents of the session keep
+    announcing normally, with the same peer_id: no stop/start burst, no 15-minute pause.
+    A session for the same rule's other part (qBittorrent / imported) is joined the same
+    way, so one JVM serves both. Returns True when handled, False when a (re)start is
+    needed (an incompatible own process is then already stopped). Caller holds RUNNER_LOCK.
+    `recheck(added_hashes)` may raise to refuse additions (qBittorrent resumed a torrent)."""
+    rid = rule["id"]
+    own = RUNNERS.get(rid)
+    if own is not None and own.poll() is None:
+        proc = own
+    else:
+        partner = RUNNERS.get(_partner_id(rid))
+        proc = partner if partner is not None and partner.poll() is None else None
+        if own is not None:
+            runner_stop(rid)                # exited process: release its assignment first
+    if proc is None:
+        return False
+    current = set(ACTIVE_HASHES.get(rid, set())) if proc is own else set()
+    others = {h for key in getattr(proc, 'parts', {rid}) if key != rid for h in ACTIVE_HASHES.get(key, set())}
+    sizes = dict(getattr(proc, 'payload_sizes', {}))
+    total = sum(size for h, size in sizes.items() if h not in current) + sum(len(p) for p in selected.values())
+    compatible = (getattr(proc, 'engine', None) == 'joal' and getattr(proc, 'config_key', None) == joal_config_key(rule)
+                  and joal_heap_mb(total) <= getattr(proc, 'heap_mb', 0) and not set(selected) & others
+                  and getattr(proc, 'root', None) is not None)
+    if not compatible:
+        if proc is own:
+            runner_stop(rid)
+        return False
+    added = set(selected) - current
+    removed = current - set(selected)
+    if any(key not in (rid, _partner_id(rid)) and p.poll() is None and ACTIVE_HASHES.get(key, set()) & added
+           for key, p in RUNNERS.items()):
+        raise RuntimeError("Torrent déjà en simulation dans un autre processus")
+    if added and recheck is not None:
+        recheck(added)
+    folder = proc.root / "torrents"
+    if removed:
+        save_final_volumes(rid, proc)
+    for h in removed:
+        (folder / (h + ".torrent")).unlink(missing_ok=True)
+        sizes.pop(h, None)
+    for h in sorted(added):
+        _write_session_torrent(folder, h, selected[h])
+        sizes[h] = len(selected[h])
+    proc.payload_sizes = sizes
+    ACTIVE_HASHES[rid] = set(selected)
+    if proc is not own:
+        RUNNERS[rid] = proc
+        proc.parts = set(getattr(proc, 'parts', set())) | {rid}
+        LOG.info("JOAL %s : rattaché à la session existante (%d torrent(s))", rid, len(added))
+        safe_audit('start_rule', rid, sorted(selected))
+    elif added or removed:
+        LOG.info("JOAL %s : %d torrent(s) ajouté(s), %d retiré(s) sans relance", rid, len(added), len(removed))
+    return True
+
+
+def runner_remove(rid, hashes):
+    """Take some torrents out of a running JOAL without stopping the others (v1.33).
+    Falls back to stopping the session when that is not possible. Caller holds RUNNER_LOCK."""
+    proc = RUNNERS.get(rid)
+    hashes = set(hashes) & set(ACTIVE_HASHES.get(rid, set()))
+    if proc is None or not hashes:
+        return
+    remaining = set(ACTIVE_HASHES.get(rid, set())) - hashes
+    if (not remaining or proc.poll() is not None or getattr(proc, 'engine', None) != 'joal'
+            or not isinstance(getattr(proc, 'root', None), Path)):
+        runner_stop(rid)
+        return
+    try:
+        save_final_volumes(rid, proc)
+        for h in hashes:
+            (proc.root / "torrents" / (h + ".torrent")).unlink(missing_ok=True)
+            proc.payload_sizes.pop(h, None)
+    except OSError:
+        runner_stop(rid)
+        return
+    ACTIVE_HASHES[rid] = remaining
+    LOG.info("JOAL %s : %d torrent(s) retiré(s) sans relance", rid, len(hashes))
 
 
 def runner_start(rule, selected):
@@ -622,6 +858,9 @@ def runner_start(rule, selected):
     if rid in RUNNERS:
         save_final_volumes(rid, RUNNERS[rid])
     root = DATA / "runtime" / rid
+    if any(getattr(p, 'root', None) == root and p.poll() is None for p in RUNNERS.values()):
+        # The partner session (qBittorrent / imported) still runs from this folder.
+        root = DATA / "runtime" / (rid + ".2")
     torrent_dir = root / "torrents"
     torrent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
@@ -662,14 +901,17 @@ def runner_start(rule, selected):
         joal_conf = {
             "minUploadRate": rule["minUploadRate"],
             "maxUploadRate": rule["maxUploadRate"],
-            "simultaneousSeed": min(rule["simultaneousSeed"], len(selected)),
+            # Room for torrents added later without restarting JOAL (v1.33): the controller
+            # already limits each rule; the imported and qBittorrent parts may share one JVM.
+            "simultaneousSeed": joal_seed_slots(rule),
             "client": client_name,
             "keepTorrentWithZeroLeechers": True,
             "uploadRatioTarget": -1.0,
         }
         (root / "config.json").write_text(json.dumps(joal_conf, indent=2), encoding="utf-8")
         os.chmod(root / "config.json", 0o600)
-    telemetry = tempfile.TemporaryDirectory(prefix="joal-upload-")
+    # v1.34: in RAM (/dev/shm) when available: JOAL rewrites its figures every second.
+    telemetry = tempfile.TemporaryDirectory(prefix="joal-upload-", dir=TELEMETRY_DIR)
     telemetry_path = telemetry.name + "/upload.json"
     if not use_joal:
         LOG.warning("Règle %s : aucun profil .client, annonces de présence sans émulation de client "
@@ -682,7 +924,9 @@ def runner_start(rule, selected):
         # No embedded web server (v1.31): the controller never uses JOAL's web UI, whose random
         # port listened on every interface (reachable from the LAN with a br0/br1 network).
         # Measured on JOAL 2.1.37: 15 MiB and 15 threads less per session, telemetry unchanged.
-        command = ["java", *java_opts, "-Dcontroller.telemetry=" + telemetry_path,
+        port = announced_port()
+        command = ["java", *java_opts, *([f"-Dcontroller.port={port}"] if port else []),
+                   "-Dcontroller.telemetry=" + telemetry_path,
                    "-jar", str(JAR), f"--joal-conf={root}", "--spring.main.web-application-type=none"]
     # Output goes through a pipe so joal.log can rotate (LOG_MAX_MB x LOG_BACKUPS).
     proc = None
@@ -696,6 +940,12 @@ def runner_start(rule, selected):
         proc.presence_only = presence_only
         proc.engine = "joal" if use_joal else "script"
         proc.volume_session = uuid.uuid4().hex
+        proc.root = root
+        proc.parts = {rid}
+        proc.client_name = client_name if use_joal else None
+        proc.config_key = joal_config_key(rule) if use_joal else None
+        proc.heap_mb = joal_heap_limit(java_opts) if use_joal else 0
+        proc.payload_sizes = {h: len(payload) for h, payload in selected.items()}
         if proc.stdout is not None:
             log_rotation.start_pump(proc.stdout, log)
         else:
@@ -844,7 +1094,35 @@ def upload_hint_rows(snapshot):
                 row['uploadHint'] = hint
 
 
+JOAL_IDENTITIES = {}   # infohash -> {'peer', 'key', 'client'} last used by a JOAL session (v1.33)
+
+
+def remember_session_identity(rid, proc):
+    """Keep the peer_id/key JOAL used for the torrents of this session (identity.json,
+    written by the telemetry patch every 30 s)."""
+    client = getattr(proc, 'client_name', None)
+    if not isinstance(client, str):
+        return
+    try:
+        with (Path(proc.telemetry.name) / "identity.json").open() as stream:
+            data = json.load(stream)
+    except (AttributeError, OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for h in ACTIVE_HASHES.get(rid, ()):
+        value = data.get(h)
+        if (isinstance(value, list) and len(value) in (2, 3) and all(isinstance(v, str) for v in value)
+                and re.fullmatch(r'[0-9a-f]{40}', value[0]) and re.fullmatch(r'[0-9A-Za-z]{0,40}', value[1])):
+            port = int(value[2]) if len(value) == 3 and value[2].isdigit() and 1 <= int(value[2]) <= 65535 else None
+            JOAL_IDENTITIES[h] = {'peer': bytes.fromhex(value[0]).decode('latin-1'), 'key': value[1],
+                                  'client': client, 'port': port}
+    while len(JOAL_IDENTITIES) > 5000:
+        JOAL_IDENTITIES.pop(next(iter(JOAL_IDENTITIES)))
+
+
 def save_final_volumes(rid, proc):
+    remember_session_identity(rid, proc)
     if not isinstance(getattr(proc, 'volume_session', None), str):
         return
     try:
@@ -869,6 +1147,7 @@ def live_joal_upload(*, include_totals=True):
     missing = 0
     measured = []
     checkpoints = []
+    counted = set()
     with RUNNER_LOCK:
         for rid, proc in RUNNERS.items():
             if proc is None or proc.poll() is not None:
@@ -896,8 +1175,10 @@ def live_joal_upload(*, include_totals=True):
                     if changed:
                         measured.extend(changed)
                         checkpoints.append((proc, recorded, changed))
-                total += sum(row[0] for row in sample.values()
-                             if isinstance(row, list) and row and type(row[0]) is int)
+                if id(proc) not in counted:      # a JVM shared by two parts counts once (v1.33)
+                    counted.add(id(proc))
+                    total += sum(row[0] for row in sample.values()
+                                 if isinstance(row, list) and row and type(row[0]) is int)
             if getattr(proc, 'presence_only', False) is True:
                 zero_rate.update(ACTIVE_HASHES.get(rid, ()))
             for infohash in ACTIVE_HASHES.get(rid, ()):
@@ -1086,6 +1367,60 @@ def matches_watch(torrent, config, categories=None):
             or (mode == "either" and matches_tag(torrent, config["qbitTag"])))
 
 
+QBIT_ANNOUNCING = {'uploading', 'stalledUP', 'forcedUP', 'downloading', 'stalledDL', 'forcedDL'}
+QBIT_LIVE_PEERS = {}  # infohash -> counts from qBittorrent's own announces (v1.34)
+
+
+def remember_qbit_peers(torrent, trackers):
+    """Counts qBittorrent got from its own announces of a torrent it is running: the
+    controller need not scrape that torrent as well (v1.34). Only working trackers count."""
+    h = torrent.get("hash")
+    if not isinstance(h, str):
+        return
+    working = [t for t in trackers if isinstance(t, dict) and t.get("status") == 2]
+    leechers = [t["num_leeches"] for t in working if type(t.get("num_leeches")) is int and t["num_leeches"] >= 0]
+    if torrent.get("state") not in QBIT_ANNOUNCING or not leechers:
+        QBIT_LIVE_PEERS.pop(h, None)
+        return
+    seeders = [t["num_seeds"] for t in working if type(t.get("num_seeds")) is int and t["num_seeds"] >= 0]
+    QBIT_LIVE_PEERS[h] = {'leechers': max(leechers), 'seeders': max(seeders) if seeders else None,
+                          'time': time.time(), 'source': 'Annonces qBittorrent'}
+
+
+def known_peers(h, max_age_seconds, handoff_enabled):
+    """Counts that make a scrape useless: a JOAL session announcing the torrent, or
+    qBittorrent running it. qBittorrent's counts are not used when automatic handoff is on:
+    that decision keeps requiring fresh tracker scrapes."""
+    peers = joal_session_peers(h, max_age_seconds)
+    if peers or handoff_enabled:
+        return peers
+    live = QBIT_LIVE_PEERS.get(h)
+    return dict(live) if live and time.time() - live['time'] <= max_age_seconds else None
+
+
+_TRACKERS = {}        # infohash -> (monotonic time, signature, qBittorrent tracker list)
+TRACKERS_TTL = 600
+
+
+def cached_trackers(client, torrent):
+    """qBittorrent's tracker list of a stopped torrent changes rarely: read it again only
+    after 10 min or when the torrent changes (v1.33). It was one API call per torrent at
+    every evaluation. A torrent running in qBittorrent is always read fresh."""
+    h = torrent["hash"]
+    signature = (QBIT_GENERATION, id(client), torrent.get("state"), torrent.get("tracker"), torrent.get("trackers_count"),
+                 torrent.get("num_incomplete"), torrent.get("num_complete"))
+    cached = _TRACKERS.get(h)
+    now = time.monotonic()
+    if (cached and cached[1] == signature and now - cached[0] < TRACKERS_TTL
+            and is_complete_stopped(torrent)):
+        return cached[2]
+    trackers = client.trackers(h)
+    _TRACKERS[h] = (now, signature, trackers)
+    if len(_TRACKERS) > 5000:
+        _TRACKERS.pop(next(iter(_TRACKERS)))
+    return trackers
+
+
 def watched_torrents(client, config):
     if config.get("qbitFilterMode") == "either":
         categories = set(watch_categories(config))
@@ -1130,7 +1465,8 @@ def find_candidates(client, config):
     overrides = config.get("torrentRuleOverrides", {})
     for torrent in torrents:
         h = torrent["hash"]
-        trackers = client.trackers(h)
+        trackers = cached_trackers(client, torrent)
+        remember_qbit_peers(torrent, trackers)
         tracker_details = safe_tracker_details(trackers)
         observed_hosts = sorted({d["domain"] for d in tracker_details
                                  if d["protocol"] in ("http", "https", "udp")})
@@ -1240,8 +1576,8 @@ def find_candidates(client, config):
             elif mode == 'forced' and rule['id'] not in FORCED_IDS:
                 eligible, reason = False, 'Forced en attente de profil JOAL'
                 completions.discard(h)
-            elif eligible and not rule_active_now(rule):
-                eligible, reason = False, 'Hors plage horaire (' + schedule_label(rule) + ')'
+            elif eligible and not rule_open(rule):
+                eligible, reason = False, closed_reason(rule)
             current_seeders = observed.get("seeders") if scrape_valid else None
             current_seeders = current_seeders if type(current_seeders) is int and current_seeders >= 0 else None
             row = {
@@ -1833,14 +2169,25 @@ def run_once(client):
             rules_state.append({"id": rid, "state": "désactivée", "eligible": 0})
             continue
         selected = selection[rid]
-        fingerprint = hashlib.sha256(b"".join(h.encode() + hashlib.sha256(payload).digest()
-                       for h, payload in sorted(selected.items())) + json.dumps(rule, sort_keys=True).encode()).hexdigest()
-        root = DATA / "runtime" / rid
-        marker = root / "selected.sha256"
-        previous = marker.read_text().strip() if marker.is_file() else None
-        with RUNNER_LOCK:
-            proc = RUNNERS.get(rid)
-            alive = proc is not None and proc.poll() is None
+
+        def recheck(added):
+            # The regular guard also checks for unexpected reactivations of qBittorrent.
+            fresh = {t["hash"]: t for t in watched_torrents(client, config)}
+            if not all(h in fresh and is_complete_stopped(fresh[h]) for h in added):
+                raise RuntimeError("Un torrent a repris dans qBittorrent : lancement annulé")
+        handled = False
+        if selected and not config["dryRun"] and not simulations_paused():
+            try:
+                with RUNNER_LOCK:
+                    before = set(ACTIVE_HASHES.get(rid, set()))
+                    handled = runner_hot_update(rule, selected, recheck)
+            except Exception as exc:
+                LOG.warning("Mise à jour de la session %s impossible : %s", rid, exc)
+                rules_state.append({"id": rid, "eligible": len(selected), "state": f"erreur : {str(exc)[:100]}",
+                                    "minLeechers": rule["minLeechers"], "schedule": schedule_label(rule),
+                                    "dailyUploadCapGiB": rule.get("dailyUploadCapGiB", 0),
+                                    "rate": f"{rule['minUploadRate']}–{rule['maxUploadRate']} kB/s"})
+                continue
         if simulations_paused():
             state = "pause globale"
         elif config["dryRun"]:
@@ -1849,13 +2196,11 @@ def run_once(client):
             with RUNNER_LOCK:
                 runner_stop(rid)
             state = ("hors plage horaire · " + schedule_label(rule) if not rule_active_now(rule)
-                     else "aucun torrent admissible")
-        elif alive and fingerprint == previous:
-            state = "en cours"
+                     else (cap_reason(rule) or "").lower() or "aucun torrent admissible")
+        elif handled:
+            changed = len(set(selected) ^ before)
+            state = "en cours" + (f" · {changed} changement(s) sans relance" if changed else "")
         else:
-            if alive:
-                with RUNNER_LOCK:
-                    runner_stop(rid)
             # Avoid hammering trackers with reannounces after frequent swarm changes.
             elapsed = now - LAST_START.get(rid, -999999)
             if elapsed < 900:
@@ -1871,14 +2216,13 @@ def run_once(client):
                         raise RuntimeError("Un torrent a repris dans qBittorrent : lancement annulé")
                     with RUNNER_LOCK:
                         runner_start(rule, selected)
-                    root.mkdir(parents=True, exist_ok=True)
-                    marker.write_text(fingerprint)
                     state = "démarrée"
                 except Exception as exc:
                     LOG.warning("Démarrage impossible pour %s: %s", rid, exc)
                     state = f"erreur : {str(exc)[:100]}"
         rules_state.append({"id": rid, "eligible": len(selected), "state": state,
                             "minLeechers": rule["minLeechers"], "schedule": schedule_label(rule),
+                            "dailyUploadCapGiB": rule.get("dailyUploadCapGiB", 0),
                             "rate": f"{rule['minUploadRate']}–{rule['maxUploadRate']} kB/s"})
     _finish_running_joal_requests(config)
     if HANDOFF_LEDGER is not None:
@@ -1938,6 +2282,9 @@ def qbit_inventory_hashes(client, peer_counts=None):
         return None
 
 
+_PROBE_INVENTORY = {}
+
+
 def import_probe_allowed(h):
     # A running JOAL session already reports this torrent's counts: no extra announce.
     with RUNNER_LOCK:
@@ -1945,8 +2292,16 @@ def import_probe_allowed(h):
             return False
     if not QBIT_URL:
         return True
-    hashes = qbit_inventory_hashes(QBitClient(QBIT_URL, QBIT_USER, QBIT_PASS))
-    return hashes is not None and h not in hashes
+    # v1.33: one qBittorrent connection and inventory per minute, not one per probed torrent.
+    now = time.monotonic()
+    cached = _PROBE_INVENTORY.get('value')
+    if _PROBE_INVENTORY.get('generation') != QBIT_GENERATION or now - _PROBE_INVENTORY.get('time', -999) > 60:
+        client = _PROBE_INVENTORY.get('client')
+        if client is None or _PROBE_INVENTORY.get('generation') != QBIT_GENERATION:
+            client = QBitClient(QBIT_URL, QBIT_USER, QBIT_PASS)
+        cached = qbit_inventory_hashes(client)
+        _PROBE_INVENTORY.update(client=client, generation=QBIT_GENERATION, time=now, value=cached)
+    return cached is not None and h not in cached
 
 
 def forget_torrent_settings(hashes):
@@ -2163,10 +2518,11 @@ def solo_evaluate(client=None):
         SWARM_MONITOR.register_solo(h, info['name'], info['urls'], info.get('sizeBytes'))
         manual_rule = config.get('torrentRuleOverrides', {}).get(h)
         all_options = matching_rules(info, config['rules'], manual_rule)
-        options = [(r, u) for r, u in all_options if rule_active_now(r)]
-        off_schedule = [r for r, _ in all_options if not rule_active_now(r)]
+        options = [(r, u) for r, u in all_options if rule_open(r)]
+        off_schedule = [r for r, _ in all_options if not rule_open(r)]
         evaluations = []
-        torrent_cutoff = SWARM_MONITOR.now() - config['swarm']['maxAgeMinutes'] * 60
+        validity = SWARM_MONITOR.validity(h, config['swarm']['maxAgeMinutes'] * 60)
+        torrent_cutoff = SWARM_MONITOR.now() - validity
         latest = latest_torrent_count(h, by_hash.get(h, {}).get('rules', {}), saved_peers,
                                       torrent_cutoff, SWARM_MONITOR.now())
         for candidate_rule, candidate_urls in options:
@@ -2178,7 +2534,7 @@ def solo_evaluate(client=None):
             # A failed request does not invalidate an earlier, still-current response.
             # Keep evidence scoped to this rule. JOAL does not identify the responding
             # tracker, so use its count only when the rule covers all torrent URLs.
-            cutoff = SWARM_MONITOR.now() - config['swarm']['maxAgeMinutes'] * 60
+            cutoff = SWARM_MONITOR.now() - validity
             history = [point for point in history if cutoff <= point['time'] <= SWARM_MONITOR.now()
                        and type(point.get('leechers')) is int and point.get('status') in ('ok', 'partial')]
             evidence = []
@@ -2229,7 +2585,7 @@ def solo_evaluate(client=None):
             confirmed = False
             reason = 'Stop manuel' if mode == 'stop' else 'Forced en attente de profil JOAL'
         elif not rule and off_schedule:
-            reason = 'Hors plage horaire (' + schedule_label(off_schedule[0]) + ')'
+            reason = closed_reason(off_schedule[0])
         elif not rule:
             reason = (f'Règle manuelle « {manual_rule} » absente ou désactivée'
                       if manual_rule else 'Aucune règle active ne couvre les trackers')
@@ -2241,7 +2597,7 @@ def solo_evaluate(client=None):
             reason = 'Relevé des trackers en cours…'
         elif count is None:
             last = saved_peers.get(h, {}).get('leechers')
-            if last and last['time'] < SWARM_MONITOR.now() - config['swarm']['maxAgeMinutes'] * 60:
+            if last and last['time'] < SWARM_MONITOR.now() - validity:
                 reason = f"Dernier relevé trop ancien (validité {config['swarm']['maxAgeMinutes']} min)"
             elif last:
                 reason = 'Dernier compteur sans relevé exploitable pour les trackers de cette règle'
@@ -2279,9 +2635,9 @@ def solo_evaluate(client=None):
         rows.append(row)
         if confirmed:
             try:
-                filtered = filter_torrent(info['payload'], urls, h)
+                filtered = filtered_solo_payload(info, urls, h)
                 candidates.append((count if type(count) is int else -1, h, rule, filtered, row))
-            except ValueError:
+            except (ValueError, OSError):
                 row['reason'] = 'Métadonnées ou trackers invalides'
     blocked = set()
     if library and QBIT_URL:
@@ -2325,21 +2681,26 @@ def solo_evaluate(client=None):
             return
         regrouped = set()
         for rid in list(RUNNERS):
-            if not rid.startswith('solo-'):
+            if not rid.startswith('solo-') or rid in grouped:
                 continue
-            desired = grouped.get(rid, {}).get('payloads', {})
-            rule = grouped.get(rid, {}).get('rule', {})
-            switched = bool(desired) and (rule.get('maxUploadRate') == 0) != (getattr(RUNNERS[rid], 'presence_only', False) is True)
-            if switched or (desired and ACTIVE_HASHES.get(rid, set()) & blocked):
-                regrouped.add(rid)
-            if switched or config['dryRun'] or not desired or ACTIVE_HASHES.get(rid, set()) != set(desired):
-                if desired and RUNNERS[rid].poll() is None and set(desired) - ACTIVE_HASHES.get(rid, set()):
-                    regrouped.add(rid)
-                runner_stop(rid)
-        if not config['dryRun'] and not simulations_paused():
+            runner_stop(rid)
+        if config['dryRun'] or simulations_paused():
+            for rid in list(grouped):
+                if rid in RUNNERS:
+                    runner_stop(rid)
+        else:
             for rid, obj in grouped.items():
-                if rid in RUNNERS and RUNNERS[rid].poll() is None:
+                # v1.33: add/remove torrents in the running JOAL (or the rule's qBittorrent
+                # session) instead of restarting it.
+                was_running = rid in RUNNERS and RUNNERS[rid].poll() is None
+                try:
+                    if runner_hot_update(dict(obj['rule'], id=rid), obj['payloads']):
+                        continue
+                except Exception as exc:
+                    LOG.warning('JOAL uniquement %s : mise à jour impossible (%s)', rid, type(exc).__name__)
                     continue
+                if was_running:
+                    regrouped.add(rid)      # incompatible change: immediate restart, no pause
                 # Avoid restarting the same JOAL rule every few seconds.
                 if rid not in regrouped and time.monotonic() - LAST_START.get(rid, -999999) < 900:
                     left = max(1, round((900 - (time.monotonic() - LAST_START.get(rid, 0))) / 60))
@@ -2390,10 +2751,11 @@ _LOG_REASONS = (
 )
 
 
-def joal_log_reason(rid):
+def joal_log_reason(rid, root=None):
     """Short fixed label from the end of a session's joal.log (never tracker URLs or passkeys)."""
     try:
-        with (DATA / 'runtime' / rid / 'joal.log').open('rb') as stream:
+        root = root if isinstance(root, Path) else DATA / 'runtime' / rid
+        with (root / 'joal.log').open('rb') as stream:
             stream.seek(0, os.SEEK_END)
             stream.seek(max(0, stream.tell() - 65536))
             tail = stream.read().decode('utf-8', 'replace')
@@ -2424,9 +2786,12 @@ def check_runner_health():
             key = ('joal-session-' + rid)[:64]
             code = proc.poll()
             if code is not None:
-                if code not in (0, -15, 143) and not getattr(proc, 'failure_noted', False):
-                    proc.failure_noted = True
-                    reason = (joal_log_reason(rid) if getattr(proc, 'engine', 'joal') == 'joal'
+                noted = getattr(proc, 'failure_noted', set())
+                if not isinstance(noted, set):
+                    noted = {rid} if noted else set()
+                if code not in (0, -15, 143) and rid not in noted:
+                    proc.failure_noted = noted | {rid}
+                    reason = (joal_log_reason(rid, getattr(proc, 'root', None)) if getattr(proc, 'engine', 'joal') == 'joal'
                               else 'script de présence interrompu')
                     RUNNER_FAILURES[rid] = {'time': time.time(), 'reason': reason}
                     LOG.warning('Session JOAL %s arrêtée d’elle-même (code %s) : %s', rid, code, reason)
@@ -2445,10 +2810,14 @@ def check_runner_health():
                     notify_incident(key, False, f'Session JOAL « {rid} » arrêtée',
                                     f'Session JOAL « {rid} » rétablie')
                 continue
-            reason = joal_log_reason(rid)
+            reason = joal_log_reason(rid, getattr(proc, 'root', None))
             LOG.warning('Session JOAL %s sans mesure depuis %d s (%s) : arrêt', rid, STALL_AFTER_SECONDS, reason)
             RUNNER_FAILURES[rid] = {'time': time.time(), 'reason': reason}
             try:
+                # A stalled shared JVM stops for both parts (v1.33).
+                for part in sorted(k for k in (getattr(proc, 'parts', None) or {rid}) if RUNNERS.get(k) is proc and k != rid):
+                    RUNNER_FAILURES[part] = {'time': time.time(), 'reason': reason}
+                    runner_stop(part)
                 runner_stop(rid)
             except RuntimeError:
                 LOG.exception('Arrêt de la session bloquée %s non confirmé', rid)
@@ -2480,6 +2849,10 @@ def solo_loop():
         SOLO_NOW.wait(10)
 
 
+GUARD_FULL_EVERY = 30          # seconds between two full reads of the tagged torrents (v1.34)
+GUARD_FULL_NOW = threading.Event()
+
+
 def guard_loop():
     """Fast qBittorrent inventory refresh and fail-closed runner guard.
 
@@ -2488,6 +2861,7 @@ def guard_loop():
     resumed torrent. No HTTP tracker calls are made from this loop.
     """
     client = None
+    last_full = -GUARD_FULL_EVERY
     while not STOP.is_set():
         beat("guard")
         try:
@@ -2495,8 +2869,23 @@ def guard_loop():
             # An empty URL (connection removed in the WebUI) raises here and
             # takes the fail-closed path below: qBittorrent sessions stop.
             client = qbit_client(client)
-            torrent_list = watched_torrents(client, config)
-            active = {t["hash"]: t for t in torrent_list if t.get("hash")}
+            # v1.34: the safety check needs only the torrents JOAL is running (and those the
+            # handoff stopped); the whole tagged list is read every 30 s for the dashboard.
+            if time.monotonic() - last_full >= GUARD_FULL_EVERY or GUARD_FULL_NOW.is_set():
+                GUARD_FULL_NOW.clear()
+                torrent_list = watched_torrents(client, config)
+                active = {t["hash"]: t for t in torrent_list if t.get("hash")}
+                last_full = time.monotonic()
+            else:
+                torrent_list = None
+                with RUNNER_LOCK:
+                    watched = set().union(*(set(ACTIVE_HASHES.get(rid, set())) for rid, proc in RUNNERS.items()
+                                            if not rid.startswith('solo-') and proc.poll() is None))
+                if HANDOFF_LEDGER is not None:
+                    watched |= set(HANDOFF_LEDGER.owned_hashes())
+                categories = watch_categories(config)
+                active = {t["hash"]: t for t in (client.torrents_by_hashes(sorted(watched)) if watched else [])
+                          if t.get("hash") and matches_watch(t, config, categories)}
             if HANDOFF_LEDGER is not None and getattr(HANDOFF_LEDGER, 'corrupt', False):
                 raise RuntimeError('handoff-state.json illisible : rétablir une sauvegarde avant la gestion automatique')
             # The guard may run between two slower poll cycles. Never claim
@@ -2508,7 +2897,7 @@ def guard_loop():
                         with RUNNER_LOCK:
                             for rid, assigned in list(ACTIVE_HASHES.items()):
                                 if h in assigned:
-                                    runner_stop(rid)
+                                    runner_remove(rid, {h})
                         HANDOFF_LEDGER.mark_returned(h, config["handoff"]["cooldownMinutes"],
                           'Reprise qBittorrent détectée par la garde rapide')
                         returned_by_user.add(h)
@@ -2518,11 +2907,18 @@ def guard_loop():
                 for rid, hashes in running.items():
                     if rid not in RUNNERS or rid.startswith('solo-'):
                         continue
-                    if (config["dryRun"] or not hashes or
-                            any(h not in active or not is_complete_stopped(active[h]) for h in hashes)):
+                    unsafe = {h for h in hashes if h not in active or not is_complete_stopped(active[h])}
+                    if config["dryRun"] or not hashes or unsafe == hashes:
                         LOG.warning("Garde qBittorrent : arrêt JOAL %s (torrent actif, absent ou état non sûr)", rid)
                         runner_stop(rid)
                         stopped_rules.add(rid)
+                    elif unsafe:
+                        # v1.33: only the torrents concerned leave the session.
+                        LOG.warning("Garde qBittorrent : %d torrent(s) retiré(s) de JOAL %s", len(unsafe), rid)
+                        runner_remove(rid, unsafe)
+                        POLL_NOW.set()
+                        if rid not in RUNNERS:
+                            stopped_rules.add(rid)
             if stopped_rules:
                 with STATE_LOCK:
                     for item in STATUS.get("rules", []):
@@ -2533,7 +2929,7 @@ def guard_loop():
                             item["selected"] = False
                             item["eligible"] = False
                             item["reason"] = "Suspendu : qBittorrent actif ou état inconnu"
-            if CLEANUP_LEDGER is not None:
+            if CLEANUP_LEDGER is not None and torrent_list is not None:
                 with LEDGER_LOCK:
                     before = len(CLEANUP_LEDGER.entries)
                     CLEANUP_LEDGER.forget_absent(active)
@@ -2558,7 +2954,7 @@ def guard_loop():
             notify_incident('qbit-connection', False, 'Connexion qBittorrent indisponible',
                             'Connexion qBittorrent rétablie')
             notify_incident('joal-stop', False, 'Arrêt JOAL non confirmé', 'Arrêt JOAL confirmé')
-            if update_inventory_snapshot(torrent_list) or stopped_rules or returned_by_user:
+            if (torrent_list is not None and update_inventory_snapshot(torrent_list)) or stopped_rules or returned_by_user:
                 POLL_NOW.set()
         except Exception as exc:
             client = None
@@ -2597,6 +2993,71 @@ def guard_loop():
         STOP.wait(interval)
 
 
+QBIT_VERSION = {'generation': None, 'checked': 0, 'version': None}
+QBIT_PORT = {'generation': None, 'checked': 0, 'port': None}
+
+
+def refresh_qbit_port(client):
+    now = time.monotonic()
+    if QBIT_PORT['generation'] != QBIT_GENERATION or now - QBIT_PORT['checked'] > 1800:
+        try:
+            port = client.listen_port()
+        except Exception:
+            port = QBIT_PORT['port'] if QBIT_PORT['generation'] == QBIT_GENERATION else None
+        QBIT_PORT.update(generation=QBIT_GENERATION, checked=now, port=port)
+    return QBIT_PORT['port']
+
+
+def announced_port():
+    """Port JOAL announces (v1.34): qBittorrent's own when the option is on and the port known."""
+    try:
+        enabled = read_config().get('announceQbitPort', True)
+    except Exception:
+        enabled = True
+    return QBIT_PORT['port'] if enabled and QBIT_URL else None
+
+
+def profile_version(name):
+    match = re.fullmatch(r'qbittorrent-(\d+)\.(\d+)\.(\d+)\.client', name or '')
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def suggested_profile(version, names):
+    """The .client matching the real qBittorrent, else the closest older one of the same
+    major.minor version, else None."""
+    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)\S*', str(version or '').strip())
+    if not match:
+        return None
+    wanted = tuple(int(part) for part in match.groups())
+    known = {profile_version(name): name for name in names if profile_version(name)}
+    if wanted in known:
+        return known[wanted]
+    older = [v for v in known if v[:2] == wanted[:2] and v < wanted]
+    return known[max(older)] if older else None
+
+
+def client_check(client, config):
+    """Compare the profiles JOAL simulates with the real qBittorrent (v1.33). A tracker that
+    sees two qBittorrent versions from the same address may flag the account."""
+    now = time.monotonic()
+    if QBIT_VERSION['generation'] != QBIT_GENERATION or now - QBIT_VERSION['checked'] > 6 * 3600:
+        try:
+            QBIT_VERSION.update(version=client.version())
+        except Exception:
+            QBIT_VERSION.update(version=None)
+        QBIT_VERSION.update(generation=QBIT_GENERATION, checked=now)
+    version = QBIT_VERSION['version']
+    if not version:
+        return None
+    names = [p.name for p in (DATA / 'clients').glob('*.client')] if (DATA / 'clients').is_dir() else []
+    suggested = suggested_profile(version, names)
+    used = {r['id']: r.get('client') for r in config['rules'] if r.get('enabled') and r.get('client')}
+    return {'qbitVersion': version.lstrip('v'), 'suggested': suggested,
+            'exact': bool(suggested) and profile_version(suggested) == profile_version(
+                'qbittorrent-' + version.lstrip('v').split('-')[0] + '.client'),
+            'mismatched': sorted(rid for rid, name in used.items() if suggested and name != suggested)}
+
+
 def poll_loop():
     client = None
     while not STOP.is_set():
@@ -2604,6 +3065,17 @@ def poll_loop():
         try:
             client = qbit_client(client)
             run_once(client)
+            try:
+                refresh_qbit_port(client)
+            except Exception:
+                LOG.debug("Port qBittorrent illisible", exc_info=True)
+            try:
+                check = client_check(client, read_config())
+            except Exception:
+                LOG.debug("Version qBittorrent illisible", exc_info=True)
+                check = None
+            with STATE_LOCK:
+                STATUS['clientCheck'] = check
             notify_incident('qbit-poll', False, 'Évaluation qBittorrent interrompue', 'Évaluation qBittorrent rétablie')
         except Exception as exc:
             stopped = stop_qbit_runners()   # independent solo sessions are not owned by qBittorrent
@@ -2644,6 +3116,27 @@ def fresh_sample():
     POLL_NOW.set()
 
 
+SWARM_BATCH = 40              # readings per pass (grouped scrapes make them cheap)
+SWARM_SPACING = (2.0, 7.0)    # seconds between two tracker requests of one pass (v1.33)
+
+
+def joal_session_peers(h, max_age_seconds):
+    """Fresh seeders/leechers from the JOAL session announcing this torrent, or None.
+    A torrent JOAL already announces needs no scrape (v1.33)."""
+    with RUNNER_LOCK:
+        if not any(proc.poll() is None and getattr(proc, 'engine', None) == 'joal' and h in ACTIVE_HASHES.get(rid, ())
+                   for rid, proc in RUNNERS.items()):
+            return None
+    peers = SWARM_MONITOR.display_peers([h]).get(h, {}) if SWARM_MONITOR is not None else {}
+    leech = peers.get('leechers', {})
+    if leech.get('source') != 'JOAL' or not isinstance(leech.get('time'), (int, float)) \
+            or time.time() - leech['time'] > max_age_seconds or type(leech.get('count')) is not int:
+        return None
+    seed = peers.get('seeders', {})
+    return {'leechers': leech['count'], 'time': leech['time'],
+            'seeders': seed.get('count') if seed.get('time') == leech['time'] else None}
+
+
 def swarm_loop():
     """Read-only tracker watcher independent of qBittorrent connections.
 
@@ -2658,8 +3151,12 @@ def swarm_loop():
             conf = read_config()
             monitor_conf = conf["swarm"]
             if SWARM_MONITOR is not None and monitor_conf["enabled"]:
-                attempted = SWARM_MONITOR.refresh(conf["rules"], max_checks=20,
+                attempted = SWARM_MONITOR.refresh(conf["rules"], max_checks=SWARM_BATCH,
                                       min_age=monitor_conf["intervalMinutes"] * 60,
+                                      max_age=monitor_conf.get("maxIntervalMinutes", 240) * 60,
+                                      joal_peers=lambda h: known_peers(h, monitor_conf["maxAgeMinutes"] * 60,
+                                                                       conf["handoff"]["enabled"]),
+                                      pause=lambda: STOP.wait(random.uniform(*SWARM_SPACING)),
                                       overrides=conf.get('torrentRuleOverrides', {}), on_sample=fresh_sample,
                                       import_probe=lambda h: not conf['dryRun'] and not simulations_paused()
                                       and TORRENT_MODES.get(h, 'auto') == 'auto' and import_probe_allowed(h))
@@ -2678,7 +3175,8 @@ def swarm_loop():
             minutes = read_config()["swarm"]["intervalMinutes"]
         except Exception:
             minutes = 15
-        SWARM_NOW.wait(5 if attempted == 20 else minutes * 60)
+        # ±20 % around the interval: no reading at a fixed clock time (v1.33).
+        SWARM_NOW.wait(5 if attempted == SWARM_BATCH else minutes * 60 * random.uniform(0.8, 1.2))
 
 
 def cleanup_sweep(client, config, now=None):
@@ -2841,8 +3339,31 @@ STATIC = Path(__file__).resolve().parent / "static"
 
 
 
+_GZIP_STATIC = {}
+
+
+def _accepts_gzip(handler):
+    headers = getattr(handler, 'headers', None)
+    return headers is not None and 'gzip' in headers.get('Accept-Encoding', '').lower()
+
+
+def _gzip_static(name, data):
+    """Compressed copy of a static file, kept while its content is unchanged."""
+    digest = hashlib.sha1(data).digest()
+    cached = _GZIP_STATIC.get(name)
+    if not cached or cached[0] != digest:
+        cached = (digest, gzip.compress(data, compresslevel=9))
+        _GZIP_STATIC[name] = cached
+    return cached[1]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"JOALController/{APP_VERSION}"
+
+    def log_message(self, format, *args):
+        """Access log without query strings: ?token=… (widget) never reaches docker logs (v1.32)."""
+        args = tuple(re.sub(r'\?\S*', '?…', a) if isinstance(a, str) and a.count(' ') >= 1 else a for a in args)
+        super().log_message(format, *args)
 
     def setup(self):
         super().setup()
@@ -2904,9 +3425,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def send_json(self, obj, status=200, session_token=None, clear_cookie=False):
-        payload = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        payload = json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        # v1.33: /api/state with hundreds of torrents is mostly repeated keys: gzip makes it
+        # ~10x smaller every 5 s. Small answers are sent as is.
+        compressed = (len(payload) > 2048 and _accepts_gzip(self))
+        if compressed:
+            payload = gzip.compress(payload, compresslevel=5)
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
+        if compressed:
+            self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Vary', 'Accept-Encoding')
         self.security_headers()
         if session_token:
             self.set_session_cookie(session_token)
@@ -2925,8 +3454,15 @@ class Handler(BaseHTTPRequestHandler):
             data = data.replace(b'__JOAL_VERSION__', JOAL_VERSION.encode('ascii'))
             data = interface_design.render(data, 'app' if filename == 'index.html' else 'login',
                                            interface_design.current(DATA))
+        compressed = (content_type.startswith(('text/', 'image/svg')) and len(data) > 2048
+                      and _accepts_gzip(self))
+        if compressed:
+            data = _gzip_static(filename, data)
         self.send_response(200)
         self.send_header('Content-Type', content_type)
+        if compressed:
+            self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Vary', 'Accept-Encoding')
         self.security_headers()
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
@@ -2947,12 +3483,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size))
         except (ValueError, UnicodeError):
             return self.send_json({'error': 'Requête invalide'}, 400)
-        if not isinstance(body, dict) or set(body.keys()) != {'username', 'password'} or \
-                not all(isinstance(body[k], str) for k in ('username','password')):
+        if not isinstance(body, dict) or set(body.keys()) not in ({'username', 'password'}, {'username', 'password', 'code'}) or \
+                not all(isinstance(body[k], str) for k in body):
             return self.send_json({'error': 'Requête invalide'}, 400)
-        state, token, _csrf = AUTH.create(body['username'], body['password'], self.client_ip())
+        code = body.get('code') or None
+        state, token, _csrf = AUTH.create(body['username'], body['password'], self.client_ip(), code)
         if state == 'limited':
             return self.send_json({'error': 'Trop de tentatives'}, 429)
+        if state == 'totp':
+            return self.send_json({'error': 'Code de double authentification requis', 'totpRequired': True}, 401)
         if state != 'ok':
             return self.send_json({'error': 'Identifiants incorrects'}, 401)
         safe_audit('event', 'auth.login', 'Connexion à l’administration')
@@ -2964,6 +3503,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/healthz':
             # Unauthenticated liveness probe for Docker HEALTHCHECK: no data exposed.
             return self.send_json({'status': 'ok', 'version': APP_VERSION})
+        if path == '/api/widget':
+            return self.widget()
         if path == '/api/auth/session':
             return self.send_json({'authenticated': True, 'username': 'admin',
                                    'csrfToken': current_session['csrf']}
@@ -3002,6 +3543,26 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 30
             return self.send_json(STATS.summary(days))
+        if path == '/api/stats.csv':
+            if STATS is None:
+                return self.send_json({'error': 'Statistiques indisponibles'}, 503)
+            try:
+                days = max(1, min(90, int(parse_qs(urlparse(self.path).query).get('days', ['90'])[0])))
+            except ValueError:
+                days = 90
+            data = STATS.csv_text(days).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/csv; charset=utf-8')
+            self.send_header('Content-Disposition', f'attachment; filename="joal-stats-{dt.date.today().isoformat()}.csv"')
+            self.security_headers()
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return None
+        if path == '/api/widget/token':
+            return self.send_json(widget_token.public(DATA))
+        if path == '/api/account':
+            return self.send_json({**ACCOUNT.public(), 'sessions': AUTH.count()})
         if path == '/api/alerts':
             return self.send_json({**alerts.public(DATA), 'lastError': ALERTS.last_error if ALERTS else None})
         if path == '/api/interface-design':
@@ -3084,8 +3645,6 @@ class Handler(BaseHTTPRequestHandler):
                 for row in snapshot.get('torrents', []):
                     if row.get('infoHash'):
                         row['handoff'] = HANDOFF_LEDGER.public_status(row['infoHash'])
-            with STATE_LOCK:
-                snapshot["uploadHistory"] = list(UPLOAD_HISTORY)[::5]
             snapshot["simulationModes"] = TORRENT_MODES
             snapshot["simulationsPaused"] = simulations_paused()
             snapshot["joalUpload"] = live_joal_upload()
@@ -3123,6 +3682,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': 'Jeton de sécurité manquant ou expiré'}, 403)
         if path in ('/api/alerts', '/api/alerts/test'):
             return self.save_alerts(path == '/api/alerts/test')
+        if path in ('/api/widget/token', '/api/widget/token/delete'):
+            try:
+                if path.endswith('/delete'):
+                    widget_token.delete(DATA)
+                    safe_audit('event', 'widget.token.off', 'Jeton du widget supprimé')
+                    return self.send_json(widget_token.public(DATA))
+                token = widget_token.create(DATA)
+            except OSError:
+                return self.send_json({'error': 'Impossible d’enregistrer dans /data'}, 500)
+            safe_audit('event', 'widget.token', 'Jeton du widget créé')
+            return self.send_json({**widget_token.public(DATA), 'token': token})
+        if path.startswith('/api/account/'):
+            return self.account_action(path, current_session)
         if path == '/api/qbit-connection':
             if self.headers.get_content_type() != 'application/json':
                 return self.send_json({'error': 'JSON requis'}, 415)
@@ -3319,6 +3891,83 @@ class Handler(BaseHTTPRequestHandler):
             LOG.warning('Demande de basculement refusée (%s)', type(exc).__name__)
             return self.send_json({'error': 'État qBittorrent non vérifiable : demande refusée'}, 503)
 
+    def widget(self):
+        """GET /api/widget: read-only summary for home dashboards (v1.32).
+        Token in « Authorization: Bearer … » or ?token=…; no cookie, no CSRF."""
+        header = self.headers.get('Authorization', '')
+        supplied = header[7:].strip() if header[:7].lower() == 'bearer ' else \
+            parse_qs(urlparse(self.path).query).get('token', [''])[0]
+        address = 'widget:' + self.client_ip()
+        now = time.monotonic()
+        with WIDGET_LOCK:
+            blocked = WIDGET_FAILURES.get(address, (0, 0))
+            if blocked[0] >= 10 and now - blocked[1] < 300:
+                return self.send_json({'error': 'Trop de tentatives'}, 429)
+        if not widget_token.check(DATA, supplied):
+            with WIDGET_LOCK:
+                count = blocked[0] + 1 if now - blocked[1] < 300 else 1
+                WIDGET_FAILURES[address] = (count, now)
+                if len(WIDGET_FAILURES) > 1024:
+                    WIDGET_FAILURES.clear()
+            return self.send_json({'error': 'Jeton du widget absent ou incorrect'}, 401)
+        with WIDGET_LOCK:
+            WIDGET_FAILURES.pop(address, None)
+        return self.send_json(widget_summary())
+
+    def account_action(self, path, current_session):
+        """Password change, sessions and TOTP (v1.32). Every sensitive action asks for
+        the current password again, so a forgotten open tab is not enough."""
+        if self.headers.get_content_type() != 'application/json':
+            return self.send_json({'error': 'JSON requis'}, 415)
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if not 0 < length <= 2048:
+                raise ValueError()
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict) or not all(isinstance(v, str) for v in body.values()):
+                raise ValueError()
+        except (ValueError, UnicodeError):
+            return self.send_json({'error': 'Requête invalide'}, 400)
+        keep = current_session.get('id')
+        if path == '/api/account/sessions/revoke':
+            closed = AUTH.revoke_all(keep_id=keep)
+            safe_audit('event', 'auth.revoke', f'{closed} autre(s) session(s) fermée(s)')
+            return self.send_json({'closed': closed})
+        if path == '/api/account/totp/confirm':
+            try:
+                ACCOUNT.confirm_totp(body.get('code', ''))
+            except ValueError as exc:
+                return self.send_json({'error': str(exc)}, 400)
+            except OSError:
+                return self.send_json({'error': 'Impossible d’enregistrer dans /data'}, 500)
+            closed = AUTH.revoke_all(keep_id=keep)
+            safe_audit('event', 'auth.totp.on', 'Double authentification activée')
+            return self.send_json({**ACCOUNT.public(), 'closed': closed})
+        if path not in ('/api/account/password', '/api/account/totp/start', '/api/account/totp/disable'):
+            return self.send_json({'error': 'Not found'}, 404)
+        if not ACCOUNT.check_password(body.get('current', '')):
+            return self.send_json({'error': 'Mot de passe actuel incorrect'}, 403)
+        try:
+            if path == '/api/account/totp/start':
+                return self.send_json(ACCOUNT.start_totp())
+            if path == '/api/account/totp/disable':
+                if ACCOUNT.totp_enabled() and not ACCOUNT.check_totp(body.get('code', '')):
+                    return self.send_json({'error': 'Code de double authentification incorrect'}, 403)
+                ACCOUNT.disable_totp()
+                safe_audit('event', 'auth.totp.off', 'Double authentification désactivée')
+                return self.send_json(ACCOUNT.public())
+            new = body.get('new', '')
+            if new != body.get('confirm', ''):
+                return self.send_json({'error': 'Les deux saisies diffèrent'}, 400)
+            encoded = ACCOUNT.set_password(new)
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 400)
+        except OSError:
+            return self.send_json({'error': 'Impossible d’enregistrer dans /data'}, 500)
+        closed = AUTH.revoke_all(keep_id=keep)
+        safe_audit('event', 'auth.password', 'Mot de passe admin modifié')
+        return self.send_json({**ACCOUNT.public(), 'closed': closed, 'hash': encoded})
+
     def save_alerts(self, test):
         """POST /api/alerts saves; POST /api/alerts/test sends a test with the saved settings."""
         try:
@@ -3498,8 +4147,13 @@ def apply_restore_safely():
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if not PASSWORD or PASSWORD.startswith("REMPLACER") or len(PASSWORD) < 12:
-        raise SystemExit("Définir ADMIN_PASSWORD (12 caractères minimum) dans .env")
+    problem = ACCOUNT.startup_problem()
+    if problem:
+        raise SystemExit(problem)
+    if ACCOUNT.source() == 'interface' and (PASSWORD or os.environ.get('ADMIN_PASSWORD_HASH')):
+        LOG.info('Mot de passe admin défini dans l’interface : ADMIN_PASSWORD / ADMIN_PASSWORD_HASH ignorés')
+    if ACCOUNT.totp_disabled_by_env():
+        LOG.warning('DISABLE_TOTP=1 : double authentification désactivée (mode récupération)')
     DATA.mkdir(parents=True, exist_ok=True)
     if not CONFIG.exists():
         shutil.copy("/app/config.example.json", CONFIG)
@@ -3534,6 +4188,7 @@ def main():
     global SWARM_MONITOR
     SWARM_MONITOR = SwarmMonitor(DATA / "tracker-registry.json")
     SWARM_MONITOR.identity_for = probe_identity
+    tracker_scrape.SCRAPE_IDENTITY = probe_identity
     global SOLO_LIBRARY
     SOLO_LIBRARY = SoloLibrary(DATA / 'torrents')
     try:
@@ -3565,6 +4220,12 @@ def main():
         notify_incident('backup-restore', True, 'Restauration refusée : ' + restore_rejected,
                         'Restauration appliquée')
     apply_qbit_connection()
+    if QBIT_URL:
+        # Port to announce known before the first JOAL session (else it would restart once).
+        try:
+            refresh_qbit_port(qbit_client())
+        except Exception:
+            LOG.info("Port qBittorrent pas encore lisible : JOAL annoncera le sien")
     history_worker = supervised(upload_history_loop, "upload-history")
     history_worker.start()
     supervised(swarm_loop, "swarm").start()

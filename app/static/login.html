@@ -31,6 +31,8 @@
           <input id="login-username" type="text" name="username" autocomplete="username" value="admin" required maxlength="80" autofocus>
           <label for="login-password">Mot de passe</label>
           <div class="password-field"><input id="login-password" type="password" name="password" autocomplete="current-password" required maxlength="1024" placeholder="Votre mot de passe administrateur"><button type="button" id="toggle-password" aria-label="Afficher le mot de passe" aria-pressed="false">Afficher</button></div>
+          <div id="totp-field" hidden><label for="login-code">Code de double authentification</label>
+          <input id="login-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" placeholder="6 chiffres de l’application"></div>
           <div id="login-error" class="login-error" role="alert" aria-live="polite" hidden></div>
           <button id="login-submit" class="submit" type="submit">Se connecter <span aria-hidden="true">→</span></button>
         </form>

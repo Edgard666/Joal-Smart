@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / 'app'))
 from core import encode_bencode  # noqa: E402
 
 SEEDERS, LEECHERS = 7, 3
+ANNOUNCED_PORT = 51413      # v1.34: JOAL must announce the port the controller gives it
 
 
 def fake_tracker():
@@ -102,12 +103,31 @@ def joal_check(run_joal, clients):
         announce = next((s for s in seen if 'info_hash=' in s['path']), None)
         if announce is None:
             raise SystemExit('ÉCHEC : aucune annonce reçue par le faux tracker')
+        port = urllib.parse.parse_qs(urllib.parse.urlsplit(announce['path']).query).get('port', [''])[0]
+        if port != str(ANNOUNCED_PORT):
+            raise SystemExit(f'ÉCHEC : port annoncé {port!r} au lieu de {ANNOUNCED_PORT} (patch ConnectionHandler)')
         profile_data = json.loads((conf / 'clients' / profile).read_text())
         agent = next((h['value'] for h in profile_data['requestHeaders'] if h['name'].lower() == 'user-agent'), '')
         if agent and announce['agent'] != agent:
             raise SystemExit(f'ÉCHEC : User-Agent {announce["agent"]!r} au lieu de {agent!r}')
         print(f'OK JOAL : annonce reçue avec le profil {profile}, télémétrie {row[2]} seeders / {row[3]} leechers, '
               f'{row[0]} o/s simulés')
+        # v1.33: peer_id/key published for the controller. Optional: a JOAL release that
+        # breaks it only degrades discretion, so this warns instead of blocking.
+        peer = urllib.parse.parse_qs(urllib.parse.urlsplit(announce['path']).query,
+                                     encoding='latin-1').get('peer_id', [''])[0].encode('latin-1').hex()
+        for _ in range(10):
+            try:
+                identity = json.loads((tele / 'identity.json').read_text()).get(infohash)
+            except (OSError, ValueError):
+                identity = None
+            if identity:
+                break
+            time.sleep(1)
+        if identity and identity[0] == peer:
+            print('OK JOAL : identité de session publiée (peer_id identique à l’annonce)')
+        else:
+            print('::warning::identity.json absent ou différent : les relevés du contrôleur garderont leur propre identité')
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -156,7 +176,10 @@ def main():
     group.add_argument('--image')
     group.add_argument('--jar')
     args = parser.parse_args()
-    java = ['-Xmx256m', '-XX:+ExitOnOutOfMemoryError']
+    # Same JVM options as the controller's sessions (v1.33), on the image's jlink runtime.
+    java = ['-Xmx256m', '-XX:+UseSerialGC', '-XX:MaxMetaspaceSize=96m', '-XX:TieredStopAtLevel=1',
+            '-XX:CICompilerCount=1', '-XX:ReservedCodeCacheSize=24m', '-Xss256k', '-XX:+ExitOnOutOfMemoryError',
+            f'-Dcontroller.port={ANNOUNCED_PORT}']
     if args.jar:
         env = {k: v for k, v in os.environ.items() if k not in ('_JAVA_OPTIONS', 'JAVA_TOOL_OPTIONS')}
 

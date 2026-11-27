@@ -75,7 +75,7 @@
     $('page-title').textContent = views[target][0];
     $('page-subtitle').textContent = views[target][1];
     if (target === 'rules') renderRuleEditor();
-    if (target === 'settings') { renderSettings(); if (!qbitReady) loadQbit(); loadAlerts(); }
+    if (target === 'settings') { renderSettings(); if (!qbitReady) loadQbit(); loadAlerts(); loadAccount(); loadWidget(); }
     if (target === 'torrents') { renderTorrents(); requestAnimationFrame(updateTorrentScrollbar); }
     if (target === 'cleanup') renderCleanup();
     if (target === 'stats') renderStats();
@@ -92,7 +92,7 @@
   };
   function ruleStatusType(s) {
     if (/erreur|impossible/i.test(s)) return 'bad';
-    if (/désactiv|aucun|attente|simulation/i.test(s)) return 'warn';
+    if (/désactiv|aucun|attente|simulation|plafond|hors plage/i.test(s)) return 'warn';
     return 'good';
   }
   function formatJoalSpeed(rate) {
@@ -171,9 +171,29 @@
     }
     $('upload-line').setAttribute('d', path.join(' '));
   }
+  function renderClientCheck() {
+    const check = (app.state || {}).clientCheck;
+    const show = !!(check && check.suggested && check.mismatched && check.mismatched.length);
+    $('client-check').hidden = !show;
+    if (!show) return;
+    $('client-check-title').textContent = `qBittorrent ${check.qbitVersion} tourne sur ce serveur`;
+    $('client-check-text').textContent = `Règle(s) ${check.mismatched.join(', ')} : JOAL simule un autre client. `
+      + 'Le tracker voit alors deux clients différents depuis la même adresse. '
+      + `Profil le plus proche du vrai qBittorrent : ${check.suggested}${check.exact ? '' : ' (version exacte absente)'}.`;
+    $('client-check-apply').textContent = `Utiliser ${check.suggested}`;
+  }
+  async function applyClientCheck() {
+    const check = (app.state || {}).clientCheck;
+    if (!check || !check.suggested || !app.config) return;
+    if (!confirm(`Utiliser ${check.suggested} pour : ${check.mismatched.join(', ')} ? Les sessions concernées redémarrent une fois.`)) return;
+    const next = deepcopy(app.config);
+    for (const rule of next.rules) if (check.mismatched.includes(rule.id)) rule.client = check.suggested;
+    if (await saveConfig(next)) { renderRuleEditor(); showToast('Profil client aligné sur qBittorrent.'); }
+  }
   function renderStatus() {
     const data = app.state || {};
     const conf = app.config || { rules: [] };
+    renderClientCheck();
     const totals = data.totals || {};
     const failed = !!data.error || !data.qbitConnected;
     $('alert').classList.toggle('hidden', !data.error);
@@ -398,7 +418,8 @@
         `Ratio local cible : ${rule.targetRatio || 'désactivé'}`,
         `≥ ${rule.minLeechers} leechers`,
         `${rule.minUploadRate}–${rule.maxUploadRate} kB/s · réglage`,
-        `Limite règle ${rule.simultaneousSeed} · globale ${conf.maxCandidates}`
+        `Limite règle ${rule.simultaneousSeed} · globale ${conf.maxCandidates}`,
+        ...(rule.dailyUploadCapGiB ? [`Plafond ${String(rule.dailyUploadCapGiB).replace('.', ',')} Gio/jour`] : [])
       ]) meta.append(newEl('span', '', text));
       card.append(meta); grid.append(card);
     }
@@ -1579,7 +1600,8 @@
         ['Torrents simultanés max.', 'simultaneousSeed', rule.simultaneousSeed, { type: 'number', min: '1', max: '250' }],
         ['Vitesse minimale (kB/s)', 'minUploadRate', rule.minUploadRate, { type: 'number', min: '0', max: '100000' }],
         ['Vitesse maximale (kB/s)', 'maxUploadRate', rule.maxUploadRate, { type: 'number', min: '0', max: '100000' }],
-        ['Ratio cible qBittorrent (0 = désactivé)', 'targetRatio', rule.targetRatio ?? 0, { type: 'number', min: '0', max: '100', step: '0.05' }]
+        ['Ratio cible qBittorrent (0 = désactivé)', 'targetRatio', rule.targetRatio ?? 0, { type: 'number', min: '0', max: '100', step: '0.05' }],
+        ['Plafond d’upload simulé par jour (Gio, 0 = aucun)', 'dailyUploadCapGiB', rule.dailyUploadCapGiB ?? 0, { type: 'number', min: '0', max: '100000', step: '0.5' }]
       ];
       for (const [label, key, val, options] of definitions) {
         const [wrapper, input] = field(label, key, val, options);
@@ -1655,6 +1677,115 @@
     $('alerts-help').textContent = ALERT_HELP[config.kind] || '';
     if (config.lastError) $('alerts-message').textContent = 'Dernier envoi en échec : ' + config.lastError;
   }
+  const ACCOUNT_SOURCE = {interface:'défini dans l’interface', hash:'ADMIN_PASSWORD_HASH (Docker)', env:'ADMIN_PASSWORD (Docker)'};
+  function showAccount(account) {
+    const sessions = account.sessions ? ` · ${account.sessions} session(s) ouverte(s)` : '';
+    $('account-summary').textContent = 'Mot de passe : ' + (ACCOUNT_SOURCE[account.source] || 'inconnu') + sessions;
+    $('totp-status').textContent = account.totpDisabledByEnv ? 'Désactivée par DISABLE_TOTP=1 (mode récupération).'
+      : account.totpEnabled ? 'Activée : un code est demandé à chaque connexion.' : 'Désactivée.';
+    $('totp-start').hidden = !!account.totpConfigured;
+    $('totp-disable').hidden = $('totp-disable-field').hidden = !account.totpConfigured;
+  }
+  async function loadAccount() {
+    try { showAccount(await api('/api/account')); } catch (error) { $('security-message').textContent = error.message; }
+  }
+  function postJson(path, body) {
+    return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  }
+  function currentPassword() {
+    const value = $('password-current').value;
+    if (!value) {
+      $('security-message').textContent = 'Saisir d’abord le mot de passe actuel dans le champ ci-dessus.';
+      $('password-current').focus();
+      return null;
+    }
+    return value;
+  }
+  async function changePassword(event) {
+    event.preventDefault();
+    $('password-save').disabled = true;
+    try {
+      const result = await postJson('/api/account/password', {current:$('password-current').value,
+        new:$('password-new').value, confirm:$('password-confirm').value});
+      for (const id of ['password-current','password-new','password-confirm']) $(id).value = '';
+      $('password-hash').textContent = 'ADMIN_PASSWORD_HASH=' + result.hash;
+      $('password-hash-box').hidden = false;
+      $('security-message').textContent = 'Mot de passe changé.' + (result.closed ? ` ${result.closed} autre(s) session(s) fermée(s).` : '');
+      showAccount(result);
+    } catch (error) { $('security-message').textContent = error.message; }
+    finally { $('password-save').disabled = false; }
+  }
+  async function revokeSessions() {
+    try {
+      const result = await postJson('/api/account/sessions/revoke', {});
+      $('security-message').textContent = result.closed ? `${result.closed} session(s) fermée(s).` : 'Aucune autre session ouverte.';
+      loadAccount();
+    } catch (error) { $('security-message').textContent = error.message; }
+  }
+  async function startTotp() {
+    const current = currentPassword();
+    if (current === null) return;
+    try {
+      const setup = await postJson('/api/account/totp/start', {current});
+      $('totp-secret').textContent = setup.secret.replace(/(.{4})/g, '$1 ').trim();
+      $('totp-uri').href = setup.uri;
+      $('totp-setup').hidden = false;
+      $('password-current').value = '';
+      $('totp-confirm-code').focus();
+    } catch (error) { $('security-message').textContent = error.message; }
+  }
+  async function confirmTotp() {
+    try {
+      const result = await postJson('/api/account/totp/confirm', {code:$('totp-confirm-code').value});
+      $('totp-setup').hidden = true;
+      $('totp-confirm-code').value = '';
+      $('security-message').textContent = 'Double authentification activée. Garder la clé en lieu sûr : elle permet de réinstaller l’application.';
+      showAccount(result);
+    } catch (error) { $('security-message').textContent = error.message; }
+  }
+  async function disableTotp() {
+    const current = currentPassword();
+    if (current === null) return;
+    const code = $('totp-disable-code').value;
+    try {
+      showAccount(await postJson('/api/account/totp/disable', {current, code}));
+      $('totp-disable-code').value = '';
+      $('password-current').value = '';
+      $('security-message').textContent = 'Double authentification désactivée.';
+    } catch (error) { $('security-message').textContent = error.message; }
+  }
+  function showWidget(state) {
+    $('widget-status').textContent = state.configured
+      ? 'Jeton actif depuis le ' + new Date(state.created * 1000).toLocaleDateString('fr-BE') + '. Créer un nouveau jeton remplace l’ancien.'
+      : 'Aucun jeton : le widget est fermé.';
+    $('widget-create').textContent = state.configured ? 'Remplacer le jeton' : 'Créer un jeton';
+    $('widget-delete').hidden = !state.configured;
+  }
+  async function loadWidget() {
+    try { showWidget(await api('/api/widget/token')); } catch (error) { $('widget-status').textContent = error.message; }
+  }
+  function widgetExample(token) {
+    return ['- JOAL Smart:', '    href: ' + location.origin, '    widget:', '      type: customapi',
+      '      url: ' + location.origin + '/api/widget', '      headers:', '        Authorization: Bearer ' + token,
+      '      mappings:', '        - field: uploadKiBps', '          label: Débit', '          suffix: " Kio/s"',
+      '        - field: uploadedTodayGiB', '          label: Aujourd’hui', '          suffix: " Gio"',
+      '        - field: activeTorrents', '          label: Torrents'].join('\n');
+  }
+  async function createWidgetToken() {
+    if (!$('widget-delete').hidden && !confirm('Remplacer le jeton ? L’ancien cessera de fonctionner.')) return;
+    try {
+      const result = await postJson('/api/widget/token', {});
+      $('widget-token').textContent = result.token;
+      $('widget-example').textContent = widgetExample(result.token);
+      $('widget-new').hidden = false;
+      showWidget(result);
+    } catch (error) { $('widget-status').textContent = error.message; }
+  }
+  async function deleteWidgetToken() {
+    if (!confirm('Supprimer le jeton du widget ?')) return;
+    try { showWidget(await postJson('/api/widget/token/delete', {})); $('widget-new').hidden = true; }
+    catch (error) { $('widget-status').textContent = error.message; }
+  }
   async function loadAlerts() {
     try { showAlerts(await api('/api/alerts')); } catch (error) { $('alerts-message').textContent = error.message; }
   }
@@ -1684,6 +1815,7 @@
   function renderSettings() {
     if (!app.config) return;
     $('setting-dryrun').checked = !!app.config.dryRun;
+    $('setting-qbit-port').checked = app.config.announceQbitPort !== false;
     $('setting-filter-mode').value = app.config.qbitFilterMode || 'tag';
     $('tag-field').classList.toggle('hidden', $('setting-filter-mode').value === 'category');
     $('category-field').classList.toggle('hidden', $('setting-filter-mode').value === 'tag');
@@ -1702,6 +1834,7 @@
     $('setting-swarm-enabled').checked = !!sw.enabled;
     $('setting-swarm-interval').value = str(sw.intervalMinutes);
     $('setting-swarm-age').value = str(sw.maxAgeMinutes);
+    $('setting-swarm-max-interval').value = str(sw.maxIntervalMinutes ?? 240);
     const h = app.config.handoff || {enabled: false, cooldownMinutes: 60, confirmations: 2, fastTrackMargin: 5};
     $('setting-handoff-enabled').checked = !!h.enabled;
     $('setting-handoff-cooldown').value = str(h.cooldownMinutes || 60);
@@ -1851,25 +1984,32 @@
     }
     const button = $('import-submit'); button.disabled = true;
     $('import-message').textContent = `Enregistrement de ${files.length} fichier(s)…`;
+    // v1.31.1: files picked while this request runs belong to a new selection; its end must not
+    // erase them (nor their analysis). Only an untouched selection is reset with the result.
+    const revision = importRevision;
     try {
       const response = await api('/api/import/add', {method:'POST', body:importPayload(files)});
       const rows = importRows(response, files);
       const added = rows.filter(x => x.status === 'added').length;
       const duplicate = rows.filter(x => x.status === 'duplicate').length;
       const errors = rows.filter(x => x.status === 'error').length;
-      // Invalidates in-flight analysis requests; results remain visible after selection reset.
-      importRevision++;
-      inspectedFiles = [];
-      $('import-file').value = '';
       applyLibraryEdit(rows.filter(row => row.status === 'added' && row.item).map(row => row.item));
-      showImportRows(rows, true);
-      $('import-message').textContent = `${added} importé(s), ${duplicate} doublon(s), ${errors} erreur(s).`;
+      if (revision === importRevision) {
+        // Invalidates in-flight analysis requests; results remain visible after selection reset.
+        importRevision++;
+        inspectedFiles = [];
+        $('import-file').value = '';
+        showImportRows(rows, true);
+        $('import-message').textContent = `${added} importé(s), ${duplicate} doublon(s), ${errors} erreur(s).`;
+      }
       showToast(`${added} fichier(s) ajouté(s) à JOAL uniquement.`);
       await fetchStatus();
     } catch (e) {
       showToast(e.message, true);
-      $('import-message').textContent = e.message;
-      button.disabled = false;
+      if (revision === importRevision) {
+        $('import-message').textContent = e.message;
+        button.disabled = false;
+      }
     }
   }
 
@@ -2174,9 +2314,10 @@
       $(id).addEventListener('input', () => { app.config[key] = isNumber ? ($(id).value === '' ? null : Number($(id).value)) : $(id).value; updateDirty(); });
     }
     $('setting-dryrun').addEventListener('change', () => { app.config.dryRun = $('setting-dryrun').checked; updateDirty(); });
+    $('setting-qbit-port').addEventListener('change', () => { app.config.announceQbitPort = $('setting-qbit-port').checked; updateDirty(); });
     const cfgSwarm = () => (app.config.swarm ||= { enabled: true, intervalMinutes: 15, maxAgeMinutes: 45 });
     $('setting-swarm-enabled').addEventListener('change', () => { cfgSwarm().enabled = $('setting-swarm-enabled').checked; updateDirty(); });
-    for (const [id, key] of [['setting-swarm-interval','intervalMinutes'],['setting-swarm-age','maxAgeMinutes']]) {
+    for (const [id, key] of [['setting-swarm-interval','intervalMinutes'],['setting-swarm-age','maxAgeMinutes'],['setting-swarm-max-interval','maxIntervalMinutes']]) {
       $(id).addEventListener('input', () => { cfgSwarm()[key] = $(id).value === '' ? null : Number($(id).value); updateDirty(); });
     }
 
@@ -2210,6 +2351,14 @@
     }
     $('qbit-connection').addEventListener('submit', event => { event.preventDefault(); saveQbit(false); });
     $('alerts-form').addEventListener('submit', saveAlerts);
+    $('password-form').addEventListener('submit', changePassword);
+    $('sessions-revoke').addEventListener('click', revokeSessions);
+    $('totp-start').addEventListener('click', startTotp);
+    $('totp-confirm').addEventListener('click', confirmTotp);
+    $('totp-disable').addEventListener('click', disableTotp);
+    $('widget-create').addEventListener('click', createWidgetToken);
+    $('client-check-apply').addEventListener('click', applyClientCheck);
+    $('widget-delete').addEventListener('click', deleteWidgetToken);
     $('stats-refresh').addEventListener('click', renderStats);
     $('whats-new-close').addEventListener('click', () => $('whats-new-dialog').close());
     $('whats-new-open').addEventListener('click', () => showWhatsNew('0', false));

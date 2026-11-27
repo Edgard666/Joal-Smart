@@ -44,6 +44,8 @@ with sync_playwright() as p:
         }
         if (url === '/api/import/add') {
           window.importedNames.push(req.body.get('torrent').name);
+          // Slow server (as on GitHub's runners): a new selection arrives during the request.
+          if (req.body.get('torrent').name.includes('lente')) await new Promise(r => setTimeout(r, 800));
           return new Response(JSON.stringify({message:'Enregistré dans /data/torrents'}),
              {status:200,headers:{'Content-Type':'application/json'}});
         }
@@ -84,6 +86,22 @@ with sync_playwright() as p:
     page.locator('#import-submit').click()
     page.wait_for_function("window.importedNames.length === 2")
     assert page.evaluate('window.importedNames') == ['premier.torrent', 'nouvelle.torrent']
+
+    upload('invalide.torrent')
+    page.wait_for_function("document.querySelector('#import-message').textContent.includes('Métadonnées incorrectes')")
+    assert page.locator('#import-submit').is_disabled()
+
+    # v1.31.1: files picked while an import is being sent are kept with their analysis.
+    upload('lente.torrent')
+    page.wait_for_function("document.querySelector('#import-submit').disabled === false")
+    page.locator('#import-submit').click()
+    page.wait_for_function("window.importedNames.length === 3")      # request sent, answer delayed 800 ms
+    upload('suivante.torrent')
+    page.wait_for_timeout(1200)                                       # the slow answer has arrived meanwhile
+    assert page.evaluate("document.getElementById('import-file').files[0]?.name") == 'suivante.torrent'
+    assert 'suivante.torrent' in page.locator('#import-preview').inner_text()
+    assert page.locator('#import-submit').is_enabled()
+    assert '1 fichier(s) analysé(s) sur 1' in page.locator('#import-message').inner_text()
 
     upload('invalide.torrent')
     page.wait_for_function("document.querySelector('#import-message').textContent.includes('Métadonnées incorrectes')")

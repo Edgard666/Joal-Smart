@@ -1,5 +1,57 @@
 # Journal des versions
 
+## v1.34.0 · JOAL se présente comme le vrai qBittorrent
+
+**Discrétion**
+- **Port de qBittorrent annoncé** (Paramètres, activé par défaut) : JOAL annonce aux trackers le port d'écoute du vrai qBittorrent, lu dans ses réglages. Le tracker voit une seule adresse, un seul port et une seule version de client, au lieu d'un second client « non connectable » sur le port fermé 49152.
+- **Plus d'appel aux sites d'adresse IP** : chaque JOAL interrogeait 5 sites publics (akamai, ipecho, ident.me…) au démarrage puis toutes les 90 min, avec un faux navigateur Chrome 65, alors qu'aucun profil n'envoie cette adresse aux trackers. Ces appels sont supprimés.
+- **Torrents actifs dans qBittorrent** : plus de relevé, le contrôleur reprend les chiffres que qBittorrent reçoit de ses propres annonces. Exception : avec le basculement automatique activé, les relevés restent exigés pour cette décision.
+- Ces deux modifications de JOAL sont vérifiées à chaque construction sur le vrai JOAL ; une version de JOAL incompatible bloque la publication.
+
+**Légèreté et fiabilité**
+- Télémétrie de JOAL en mémoire (`/dev/shm`) au lieu du disque : environ 170 000 écritures disque en moins par jour et par session ; le fichier des annonces n'est réécrit que s'il change.
+- Garde qBittorrent : toutes les 5 s, seuls les torrents en cours dans JOAL sont demandés à qBittorrent ; la liste complète des torrents suivis est relue toutes les 30 s (l'affichage d'un torrent repris dans qBittorrent peut donc prendre jusqu'à 30 s ; l'arrêt de JOAL, lui, reste sous 5 s).
+- **Image sur Ubuntu 24.04** (Python 3.12, la version des tests) et Java 21 « noble ». Le build GitHub lance maintenant tous les tests **dans l'image construite**, avec l'utilisateur 99:100 et le vrai JOAL modifié (ajout/retrait à chaud, port annoncé).
+- Tests : 451 tests unitaires (aussi passés avec Python 3.12, en lecture seule et en utilisateur 99) et 17 tests navigateur.
+
+## v1.33.0 · Plus discret pour les trackers, plus léger
+
+**Discrétion**
+- **Plus de relance de JOAL** quand un torrent entre ou sort d'une session : il est ajouté ou retiré à chaud. Seul ce torrent s'annonce (démarrage ou arrêt) ; les autres continuent avec le même identifiant client, sans rafale d'annonces ni pause anti-relance de 15 min. Modifier le plafond, la plage horaire ou le seuil d'une règle ne relance plus JOAL non plus. La garde qBittorrent ne retire que le torrent repris dans qBittorrent.
+- **Un seul JOAL par règle** pour les torrents qBittorrent et importés (avant : deux processus, donc deux clients différents vus par le tracker). Le débit de la règle est désormais partagé entre ces torrents, comme pour un vrai client.
+- **Relevés adaptatifs** : un torrent sans leecher depuis longtemps est relevé de moins en moins souvent (×2 après 1 h, ×4 après 6 h, ×8 après 24 h, 4 h maximum par défaut, réglable). Le premier leecher vu le ramène à 15 min. Ses relevés restent valables entre deux passages.
+- **Aucun relevé** pour un torrent que JOAL annonce déjà : ses annonces donnent les chiffres.
+- **Relevés groupés** : plusieurs torrents d'un même tracker en une seule requête (HTTP et UDP, comme Transmission). Repli automatique un par un si le tracker refuse.
+- **Requêtes étalées** : 2 à 7 s entre deux requêtes, et ±20 % sur l'intervalle (plus de rafale toutes les 15 min pile).
+- **Même identité** : après une session, les relevés du contrôleur reprennent le peer_id, la clé et le port que JOAL utilisait pour ce torrent.
+- **Profil aligné sur qBittorrent** : si JOAL simule une autre version que le qBittorrent réel du serveur, la page Règles l'indique et propose le profil correspondant en un clic.
+
+**Légèreté**
+- Options Java allégées, mesurées sur le vrai JOAL : 183 → 155 Mio par session, 6,5 → 3,5 s de processeur au démarrage.
+- **Image Docker** : Java réduit par jlink aux modules utiles à JOAL (57 Mio au lieu du JRE complet), sur une base Ubuntu 22.04.
+- Bibliothèque importée : chaque `.torrent` n'est plus relu et décodé toutes les 10 s (0,3 s pour un fichier de 20 Mio), seulement s'il change ; son contenu ne reste plus en mémoire.
+- qBittorrent : liste des trackers d'un torrent arrêté gardée 10 min (avant : un appel par torrent à chaque évaluation) ; une seule connexion par minute pour les vérifications avant relevé (avant : une par torrent).
+- Relevés écrits sur disque une fois par passage (avant : après chaque relevé, jusqu'à 20 fois) : moins d'usure du SSD, interface plus fluide.
+- Interface : réponses compressées (`/api/state` environ 10 fois plus petit, `app.js` 143 → 38 Ko) et historique de débit inutilisé retiré de `/api/state`.
+- Tests : 439 tests unitaires (dont l'ajout/retrait à chaud sur le vrai JOAL) et 17 tests navigateur.
+
+## v1.32.0 · Compte admin renforcé, plafond quotidien, widget
+
+- **Mot de passe modifiable dans l'interface** (Paramètres → Sécurité), enregistré haché (scrypt) dans `/data/admin-password.json` et prioritaire sur Docker. Le hash affiché peut aller dans la nouvelle variable `ADMIN_PASSWORD_HASH`, pour ne plus garder le mot de passe en clair dans Docker → Edit. Changer le mot de passe ferme les autres sessions.
+- **Déconnecter les autres sessions** en un clic.
+- **Double authentification facultative** (code à 6 chiffres, Aegis, 2FAS, Google Authenticator…). Un code ne sert qu'une fois. Récupération : `DISABLE_TOTP=1`. La clé n'est jamais incluse dans les sauvegardes.
+- **Plafond d'upload simulé par jour** pour chaque règle (Gio, 0 = aucun). Une fois atteint, la règle s'arrête jusqu'à minuit avec le motif « Plafond du jour atteint ». Forced n'est pas plafonné.
+- **Export CSV** des statistiques (90 jours, prêt pour Excel).
+- **Widget** pour Homepage, Homarr ou Home Assistant : `GET /api/widget` avec un jeton en lecture seule créé dans Paramètres (affiché une fois, stocké haché). Exemple Homepage dans le README.
+- **Trackers** : les relevés utilisent les en-têtes HTTP du profil `.client` (avant : « JOAL-Smart-Cleanup », repérable), acceptent les réponses gzip avec une limite de taille, et se connectent à l'adresse IP déjà vérifiée : un DNS qui change de réponse ne peut plus rediriger une requête vers le réseau local.
+- **Passkeys masquées dans `joal.log`** : les URL des trackers n'y gardent que le nom du serveur. Le journal d'accès du conteneur n'affiche plus les paramètres d'URL.
+- Tests : 416 tests unitaires et 16 tests navigateur, aussi avec le processeur saturé. Un test navigateur pouvait échouer sur une machine lente (attente interdite par la politique de sécurité de la page) : corrigé.
+
+## v1.31.2 · Import : sélection conservée pendant un envoi
+
+- **Correction** : choisir de nouveaux fichiers pendant qu'un import précédent était encore en cours d'envoi les faisait disparaître à la fin de cet envoi (sélection vidée, analyse et message d'erreur effacés). Visible sur un serveur lent ; c'est ce que le build GitHub a détecté. La fin d'un envoi ne remet plus à zéro qu'une sélection restée inchangée.
+- Test navigateur ajouté pour ce cas (envoi ralenti, nouvelle sélection pendant l'envoi) ; les 15 tests navigateur passent aussi avec le processeur saturé.
+
 ## v1.31.1 · Build GitHub corrigé
 
 - **Correction du build** : les tests navigateur utilisaient le Chrome installé sur le serveur GitHub, d'une autre version que celle attendue par Playwright, et échouaient. Le build installe maintenant le Chromium exact de Playwright, comme en développement.

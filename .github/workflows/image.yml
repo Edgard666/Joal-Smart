@@ -110,10 +110,19 @@ jobs:
           docker build \
             --build-arg JOAL_IMAGE="${{ steps.inputs.outputs.joal_image }}" \
             --build-arg JDK_IMAGE="${{ steps.inputs.outputs.jdk_image }}" \
-            --build-arg JRE_IMAGE="${{ steps.inputs.outputs.jre_image }}" \
+            --build-arg BASE_IMAGE="${{ steps.inputs.outputs.base_image }}" \
             --build-arg JOAL_VERSION="${{ steps.inputs.outputs.joal_version }}" \
             --build-arg BUILD_INPUTS="${{ steps.inputs.outputs.inputs }}" \
             -t joal-smart-controller:candidate .
+
+      - name: Tests dans l’image
+        if: steps.published.outputs.changed == 'true'
+        # v1.34: the unit tests also run with the image's Python and Java, as user 99:100;
+        # JOAL_JAR enables the tests that drive the real patched JOAL (hot add/remove, port).
+        run: |
+          docker run --rm --user 99:100 -e HOME=/tmp -e JOAL_JAR=/opt/joal/joal.jar \
+            -v "$PWD:/src:ro" -w /src/tests --entrypoint python3 joal-smart-controller:candidate \
+            -B -m unittest discover -s . -p "test_*.py"
 
       - name: Essai de bout en bout (JOAL + télémétrie + contrôleur)
         if: steps.published.outputs.changed == 'true'
@@ -131,7 +140,7 @@ jobs:
           {
             echo "### Publiée : \`$IMAGE:latest\` ($version)"
             echo "- JOAL ${{ steps.inputs.outputs.joal_version }}, ${{ steps.inputs.outputs.profiles }} profils .client"
-            echo "- Java : \`${{ steps.inputs.outputs.jre_image }}\`"
+            echo "- Java : \`${{ steps.inputs.outputs.jdk_image }}\` (jlink), base \`${{ steps.inputs.outputs.base_image }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release GitHub
@@ -145,6 +154,6 @@ jobs:
             exit 0
           fi
           python3 ci/release_notes.py "${{ steps.inputs.outputs.app_version }}" "${{ steps.inputs.outputs.joal_version }}" \
-            "${{ steps.inputs.outputs.jre_image }}" "${{ steps.inputs.outputs.profiles }}" > release-notes.md
+            "${{ steps.inputs.outputs.jdk_image }}" "${{ steps.inputs.outputs.profiles }}" > release-notes.md
           gh release create "$tag" --target "$GITHUB_SHA" --notes-file release-notes.md \
             --title "JOAL Smart Controller ${{ steps.inputs.outputs.app_version }} · JOAL ${{ steps.inputs.outputs.joal_version }}"

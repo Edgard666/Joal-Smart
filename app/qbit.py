@@ -56,6 +56,18 @@ class QBitClient:
             self.login()
             return self.request(path, params, method)
 
+    def listen_port(self):
+        """qBittorrent's incoming port (Options > Connection), or None (v1.34)."""
+        try:
+            value = json.loads(self.call("app/preferences")).get("listen_port")
+        except (ValueError, AttributeError):
+            return None
+        return value if type(value) is int and 0 < value < 65536 else None
+
+    def version(self):
+        """Real qBittorrent version, e.g. 'v5.0.4' (used to align the JOAL profile, v1.33)."""
+        return self.call("app/version").decode("utf-8", "replace").strip()[:40]
+
     def add_tag(self, hash_, tag):
         self.call("torrents/addTags", {"hashes": hash_, "tags": tag}, method="POST")
 
@@ -149,6 +161,15 @@ class QBitClient:
             raise ValueError("Filtre qBittorrent invalide")
         data = json.loads(self.call("torrents/info", {field: tag}))
         return [t for t in data if t.get("hash")]
+
+    def torrents_by_hashes(self, hashes):
+        """torrents/info limited to these torrents (v1.34), 100 per request."""
+        result = []
+        hashes = list(hashes)
+        for start in range(0, len(hashes), 100):
+            data = json.loads(self.call("torrents/info", {"hashes": "|".join(hashes[start:start + 100])}))
+            result.extend(t for t in data if t.get("hash"))
+        return result
 
     def trackers(self, hash_):
         return json.loads(self.call("torrents/trackers", {"hash": hash_}))

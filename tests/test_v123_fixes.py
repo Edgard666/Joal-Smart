@@ -217,7 +217,7 @@ class HttpTests(unittest.TestCase):
         seen = []
         real_create = main.AUTH.create
 
-        def create(user, password, remote):
+        def create(user, password, remote, code=None):
             seen.append(remote)
             return real_create(user, password, remote)
         for trusted in (frozenset(), frozenset({'127.0.0.1'})):

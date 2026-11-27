@@ -4,7 +4,9 @@ Fed every second with the measured JOAL rates (bytes/s per torrent); kept in mem
 saved to /data/tracker-stats.json with the upload history (every 30 s), 90 days kept.
 Days follow the container's local time (TZ).
 """
+import csv
 import datetime as dt
+import io
 import json
 import os
 import threading
@@ -95,3 +97,24 @@ class TrackerStats:
         daily = [sum(snapshot[day][d]['bytes'] for d in snapshot[day]) for day in span]
         return {'days': span, 'daily': daily, 'trackers': rows,
                 'totals': {period: sum(r[period]['bytes'] for r in rows) for period in ('today', 'week', 'month')}}
+
+    def bytes_today(self, matches, now=None):
+        """Bytes counted today for the domains accepted by `matches(domain)` (daily cap, v1.32)."""
+        day = _day(now if now is not None else dt.datetime.now().timestamp())
+        with self.lock:
+            return sum(v['bytes'] for d, v in self.days.get(day, {}).items() if d != 'autre' and matches(d))
+
+    def csv_text(self, days=90, today=None):
+        """One line per day and tracker (v1.32): date;tracker;octets;Gio;secondes;torrents.
+        Semicolons and a decimal comma, so a French Excel opens it directly."""
+        today = today or dt.date.today()
+        span = [(today - dt.timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter=';', lineterminator='\r\n')
+        writer.writerow(['date', 'tracker', 'octets', 'Gio', 'secondes', 'torrents'])
+        with self.lock:
+            for day in span:
+                for domain, value in sorted(self.days.get(day, {}).items()):
+                    gib = f"{value['bytes'] / 2 ** 30:.3f}".replace('.', ',')
+                    writer.writerow([day, domain, value['bytes'], gib, value['seconds'], len(value['torrents'])])
+        return '\ufeff' + out.getvalue()

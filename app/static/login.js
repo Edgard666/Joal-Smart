@@ -21,13 +21,30 @@
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({username: $('login-username').value, password: $('login-password').value})
+        body: JSON.stringify(Object.assign({username: $('login-username').value, password: $('login-password').value},
+          $('totp-field').hidden ? {} : {code: $('login-code').value}))
       });
+      if (response.status === 401 && $('totp-field').hidden) {
+        const data = await response.json().catch(() => ({}));
+        if (data.totpRequired) {
+          $('totp-field').hidden = false;
+          $('login-code').required = true;
+          errorBox.textContent = 'Saisissez le code affiché par votre application d’authentification.';
+          errorBox.hidden = false;
+          $('login-code').focus();
+          return;
+        }
+      }
       if (!response.ok) {
         errorBox.textContent = response.status === 429 ? 'Trop de tentatives. Réessayez plus tard.' : 'Identifiants incorrects ou accès refusé.';
         errorBox.hidden = false;
-        $('login-password').value = '';
-        $('login-password').focus();
+        $('login-code').value = '';
+        if ($('totp-field').hidden) {
+          $('login-password').value = '';
+          $('login-password').focus();
+        } else {
+          $('login-code').focus();
+        }
         return;
       }
       $('login-password').value = '';

@@ -70,6 +70,7 @@ class SoloLibrary:
         self.root = Path(root)
         self._lock = threading.RLock()
         self._hashes = {}
+        self._parsed = {}       # path -> (signature, info without payload) (v1.33)
 
     def _adjust_permissions(self, path, mode):
         """Best-effort Unraid nobody:users permissions, on .torrent files only.
@@ -194,21 +195,55 @@ class SoloLibrary:
         info['fileName'] = stored_name
         return info
 
+    @staticmethod
+    def _signature(path):
+        stat = path.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
     def list(self, rules):
-        """Read original and hash-named files; verify each torrent by its infohash."""
+        """Read original and hash-named files; verify each torrent by its infohash.
+
+        v1.33: a file is decoded again only when it changed (it was every 10 s: 0.3 s for a
+        20 MiB .torrent), and the metadata no longer stays in memory: payload(info) reads it
+        when a session needs it."""
         result = []
         with self._lock:
-            for path in self._torrent_paths():
+            paths = self._torrent_paths()
+            for gone in set(self._parsed) - set(paths):
+                self._parsed.pop(gone, None)
+            for path in paths:
                 try:
-                    info, blob = self._read_torrent(path, rules)
-                    info['urls'] = announce_urls(blob)
-                    info['payload'] = blob
-                    info['fileName'] = path.name
-                    info['addedOn'] = path.stat().st_mtime
+                    signature = self._signature(path)
+                    cached = self._parsed.get(path)
+                    if cached is None or cached[0] != signature:
+                        info, blob = self._read_torrent(path, [])
+                        info['urls'] = announce_urls(blob)
+                        info['fileName'] = path.name
+                        info['addedOn'] = path.stat().st_mtime
+                        info['path'] = path
+                        info['signature'] = signature
+                        cached = (signature, info)
+                        self._parsed[path] = cached
+                    info = dict(cached[1])
+                    info['matchedDomains'] = sorted(
+                        host for host in info['domains']
+                        if any(r.get('enabled') and any(domain_matches(host, d) for d in r.get('trackerDomains', []))
+                               for r in rules))
                     result.append(info)
                 except (OSError, ValueError, ImportErrorValue, RecursionError):
                     continue
         return result
+
+    def payload(self, info):
+        """The .torrent bytes of a listed torrent; refused if the file changed since list()."""
+        path = info['path']
+        with self._lock:
+            if self._signature(path) != info['signature']:
+                raise ImportErrorValue('Fichier .torrent modifié depuis la lecture')
+            blob = path.read_bytes()
+        if len(blob) > MAX_TORRENT_BYTES:
+            raise ImportErrorValue('Métadonnées .torrent trop volumineuses')
+        return blob
 
     def delete_many(self, infohashes):
         """Delete several .torrent files in a single pass over the library (v1.30.2).

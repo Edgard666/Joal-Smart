@@ -36,6 +36,65 @@ public class UploadTelemetry {
         + "no response|timed out|timeout|connection|connect|refused|unknownhost|no more valid tracker|"
         + "protocol|reading tracker|read tracker|status [0-9]{3}");
 
+    // v1.34: port announced to trackers. The controller passes the real qBittorrent port, so
+    // the tracker sees one client (same address, port and version), not a second, unreachable one.
+    public static int announcedPort(int bound) {
+        String value = System.getProperty("controller.port");
+        if (value == null) return bound;
+        try {
+            int port = Integer.parseInt(value.trim());
+            return port > 0 && port < 65536 ? port : bound;
+        } catch (NumberFormatException ignored) {
+            return bound;
+        }
+    }
+
+    // v1.33: peer_id and key JOAL uses for each torrent, so the controller's occasional
+    // stopped announce after a session looks like the same client, not a second one.
+    private long identityWritten = 0;
+    private byte[] lastAnnounces = null;
+
+    private void writeIdentities(Path dest) {
+        if (System.currentTimeMillis() - identityWritten < 30000) return;
+        identityWritten = System.currentTimeMillis();
+        try {
+            Object provider = fieldOfType(manager, "BitTorrentClientProvider");
+            Object client = provider.getClass().getMethod("get").invoke(provider);
+            java.lang.reflect.Method peerId = null, key = null;
+            for (java.lang.reflect.Method method : client.getClass().getDeclaredMethods()) {
+                if (method.getName().equals("getPeerId") && method.getParameterCount() == 2) peerId = method;
+                if (method.getName().equals("getKey") && method.getParameterCount() == 2) key = method;
+            }
+            if (peerId == null) return;
+            peerId.setAccessible(true);
+            if (key != null) key.setAccessible(true);
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Object none = Enum.valueOf((Class) peerId.getParameterTypes()[1], "NONE");
+            String port = "";
+            try {
+                Object handler = fieldOfType(manager, "ConnectionHandler");
+                port = String.valueOf(handler.getClass().getMethod("getPort").invoke(handler));
+            } catch (ReflectiveOperationException | RuntimeException ignored) { }
+            Map<String, String[]> ids = new HashMap<>();
+            for (AnnouncerFacade announcer : manager.getCurrentlySeedingAnnouncers()) {
+                Object hash = announcer.getTorrentInfoHash();
+                String peer = (String) peerId.invoke(client, hash, none);
+                Object found = key == null ? Optional.empty() : key.invoke(client, hash, none);
+                Object value = found instanceof Optional ? ((Optional<?>) found).orElse(null) : null;
+                String keyValue = value == null ? "" : value.toString();
+                if (peer != null)
+                    ids.put(hex(announcer), new String[]{
+                        HexFormat.of().formatHex(peer.getBytes(StandardCharsets.ISO_8859_1)), keyValue, port});
+            }
+            Path out = dest.resolveSibling("identity.json");
+            Path staging = dest.resolveSibling("identity.tmp");
+            json.writeValue(staging.toFile(), ids);
+            Files.move(staging, out, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (ReflectiveOperationException | RuntimeException | java.io.IOException ignored) {
+            // Older or newer JOAL: the controller simply keeps its own identity.
+        }
+    }
+
     public UploadTelemetry(SeedManager manager) throws ReflectiveOperationException {
         this.manager = manager;
         dispatcherField = SeedManager.class.getDeclaredField("bandwidthDispatcher");
@@ -121,9 +180,15 @@ public class UploadTelemetry {
         Path staging = dest.resolveSibling("upload.tmp");
         json.writeValue(staging.toFile(), rows);
         Files.move(staging, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        Path announceDest = dest.resolveSibling("announce.json");
-        Path announceStaging = dest.resolveSibling("announce.tmp");
-        json.writeValue(announceStaging.toFile(), announces);
-        Files.move(announceStaging, announceDest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        // v1.34: announce outcomes change once per announce, not every second.
+        byte[] announceBytes = json.writeValueAsBytes(announces);
+        if (!Arrays.equals(announceBytes, lastAnnounces)) {
+            Path announceDest = dest.resolveSibling("announce.json");
+            Path announceStaging = dest.resolveSibling("announce.tmp");
+            Files.write(announceStaging, announceBytes);
+            Files.move(announceStaging, announceDest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            lastAnnounces = announceBytes;
+        }
+        writeIdentities(dest);
     }
 }

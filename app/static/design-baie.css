@@ -560,3 +560,10 @@ dialog::backdrop{background:#1A232D73}
 .whats-new-version li{margin:4px 0;line-height:1.45}
 .link-button{background:none;border:0;padding:0;color:inherit;font:inherit;text-decoration:underline;cursor:pointer}
 .link-button:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+/* v1.32 : sécurité du compte, widget, plafond */
+.settings-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:12px 0}
+.settings-actions label{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.copy-box{white-space:pre-wrap;word-break:break-all;user-select:all;font-family:var(--mono);font-size:12px;background:var(--face-2);border:1px solid var(--line-soft);border-radius:3px;padding:8px 10px;margin:8px 0;color:var(--ink)}
+#security-panel h3{font-size:16px;margin:20px 0 6px}
+#totp-setup label{display:flex;flex-direction:column;gap:6px;max-width:280px}
+[hidden]{display:none!important}

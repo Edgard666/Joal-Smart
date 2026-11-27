@@ -16,8 +16,12 @@ COOKIE_NAME = 'joal_session'
 
 
 class SessionManager:
-    def __init__(self, password_getter=lambda: ''):
+    def __init__(self, password_getter=lambda: '', checker=None, second_factor=None):
+        """`checker(password) -> bool` replaces the clear-password getter (v1.32);
+        `second_factor()` -> callable(code) -> bool when TOTP is on, else None."""
         self.password_getter = password_getter
+        self.checker = checker
+        self.second_factor = second_factor or (lambda: None)
         self.lock = threading.RLock()
         self.sessions = {}  # hashed bearer token -> {csrf, created, active}
         self.failures = {}  # address -> consecutive failure count and block until
@@ -34,7 +38,7 @@ class SessionManager:
             if now - item['last'] > 900:
                 self.failures.pop(addr, None)
 
-    def create(self, username, password, remote):
+    def create(self, username, password, remote, code=None):
         now = time.monotonic()
         addr = str(remote)[:128]
         with self.lock:
@@ -42,10 +46,23 @@ class SessionManager:
             record = self.failures.get(addr, {'count': 0, 'until': 0})
             if record['until'] > now:
                 return 'limited', None, None
-            # Constant-time comparison of fixed-size digests, including for invalid username.
-            supplied = hashlib.sha256((str(username) + '\0' + str(password)).encode('utf-8', errors='surrogatepass')).digest()
-            expected = hashlib.sha256(('admin\0' + self.password_getter()).encode('utf-8')).digest()
-            if not hmac.compare_digest(supplied, expected):
+            if self.checker is not None:
+                user_ok = hmac.compare_digest(
+                    hashlib.sha256(str(username).encode('utf-8', errors='surrogatepass')).digest(),
+                    hashlib.sha256(b'admin').digest())
+                password_ok = self.checker(password)
+                ok = user_ok and password_ok
+            else:
+                # Constant-time comparison of fixed-size digests, including for invalid username.
+                supplied = hashlib.sha256((str(username) + '\0' + str(password)).encode('utf-8', errors='surrogatepass')).digest()
+                expected = hashlib.sha256(('admin\0' + self.password_getter()).encode('utf-8')).digest()
+                ok = hmac.compare_digest(supplied, expected)
+            check_code = self.second_factor() if ok else None
+            if ok and check_code is not None:
+                if code is None:
+                    return 'totp', None, None
+                ok = check_code(code)
+            if not ok:
                 count = record['count'] + 1
                 self.failures[addr] = {'count': count, 'last': now,
                                        'until': now + min(300, 30 * 2 ** (count - 5)) if count >= 5 else 0}
@@ -53,7 +70,7 @@ class SessionManager:
             self.failures.pop(addr, None)
             token = secrets.token_urlsafe(36)
             csrf = secrets.token_urlsafe(30)
-            self.sessions[self._key(token)] = {'csrf': csrf, 'created': now, 'active': now}
+            self.sessions[self._key(token)] = {'csrf': csrf, 'created': now, 'active': now, 'id': secrets.token_hex(8)}
             if len(self.sessions) > 128:
                 oldest = min(self.sessions, key=lambda k: self.sessions[k]['created'])
                 self.sessions.pop(oldest, None)
@@ -95,3 +112,16 @@ class SessionManager:
                     self.sessions.pop(self._key(token_item.value), None)
         except (CookieError, ValueError, UnicodeError):
             pass
+
+    def revoke_all(self, keep_id=None):
+        """Close every session except `keep_id` (the caller's own). Returns how many were closed."""
+        with self.lock:
+            doomed = [key for key, item in self.sessions.items() if keep_id is None or item.get('id') != keep_id]
+            for key in doomed:
+                self.sessions.pop(key, None)
+            return len(doomed)
+
+    def count(self):
+        with self.lock:
+            self._prune(time.monotonic())
+            return len(self.sessions)

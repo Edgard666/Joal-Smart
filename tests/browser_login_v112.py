@@ -49,7 +49,9 @@ def run():
                     # Le lien est dans le groupe repliable « Suivi et règles » de la barre latérale.
                     page.locator('nav summary', has_text='Suivi et règles').click()
                     page.get_by_role('button',name='Diagnostics & journal').click()
-                    page.wait_for_function('document.querySelector("#diag-events").textContent.includes("Diagnostic disponible")')
+                    # No wait_for_function here: the real server's CSP forbids eval, which Playwright
+                    # needs as soon as the condition is not already true (slow machine).
+                    page.locator('#diag-events', has_text='Diagnostic disponible').wait_for()
                     assert page.locator('#diag-processes').is_visible()
                     page.screenshot(path=str(folder/'joal-v112-diagnostics-preview.png'),full_page=True)
                     page.locator('#logout-btn').click()
