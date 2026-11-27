@@ -42,7 +42,9 @@ def run():
                     page.screenshot(path=str(folder/'joal-v112-login-preview.png'),full_page=True)
                     page.get_by_label('Mot de passe',exact=True).fill('bad-password')
                     page.get_by_role('button',name='Se connecter').click()
-                    assert page.locator('#login-error').is_visible()
+                    # v1.32+: the 401 body is read (double authentification) before the message
+                    # appears, so wait for it instead of checking at once (failed on GitHub).
+                    page.wait_for_selector('#login-error', state='visible', timeout=10000)
                     page.get_by_label('Mot de passe',exact=True).fill('browser-test-password')
                     page.get_by_role('button',name='Se connecter').click()
                     page.wait_for_url(base+'/',timeout=10000)

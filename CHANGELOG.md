@@ -1,5 +1,9 @@
 # Journal des versions
 
+## v1.34.1 · Build GitHub corrigé
+
+- **Correction d'un test** : depuis la double authentification (v1.32), la page de connexion lit la réponse du serveur avant d'afficher « Identifiants incorrects ». Le test navigateur de connexion vérifiait le message immédiatement et échouait sur le serveur GitHub, plus rapide ou plus lent selon les jours. Il attend maintenant que le message apparaisse. L'application n'a pas changé.
+
 ## v1.34.0 · JOAL se présente comme le vrai qBittorrent
 
 **Discrétion**
