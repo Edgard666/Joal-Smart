@@ -198,13 +198,18 @@ def write_config(conf):
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp, CONFIG)
-        os.chmod(CONFIG, 0o600)
     except BaseException:
         try:
             temp.unlink()
         except OSError:
             pass
         raise
+    # v1.35: the file is already saved (created 0600). A refused chmod (Unraid ACL) is only
+    # logged, instead of reporting a failed save for a configuration that was applied.
+    try:
+        os.chmod(CONFIG, 0o600)
+    except OSError as exc:
+        LOG.warning("policy.json enregistré, mais droits 0600 non appliqués (%s)", type(exc).__name__)
 
 
 ALERT_TITLES = {'error': 'JOAL Smart : problème', 'success': 'JOAL Smart : rétabli', 'info': 'JOAL Smart'}
@@ -1218,6 +1223,31 @@ def live_joal_upload(*, include_totals=True):
             "zeroRate": sorted(zero_rate)}
 
 
+LIVE_UPLOAD = {'measure': None, 'totals': None}
+
+
+def shared_joal_upload():
+    """The measure the 1-second loop already took (v1.35), plus cumulated volumes cached
+    5 s: the dashboard and the widget no longer re-read every telemetry file and the
+    SQLite database at each request. Falls back to a direct reading if the loop is late."""
+    now = time.monotonic()
+    with STATE_LOCK:
+        cached, totals = LIVE_UPLOAD['measure'], LIVE_UPLOAD['totals']
+    if cached is None or now - cached[0] > 2.5:
+        return live_joal_upload()
+    result = dict(cached[1])
+    if totals is None or now - totals[0] > 5:
+        try:
+            value = upload_history.session_volumes(DATA / 'upload-totals.sqlite', [], totals=True)
+        except (sqlite3.Error, OSError):
+            value = None
+        totals = (now, value)
+        with STATE_LOCK:
+            LIVE_UPLOAD['totals'] = totals
+    result['totalUploadedBytes'] = totals[1]
+    return result
+
+
 def tracker_domains():
     """infohash -> first tracker domain, from the last published rows (qBittorrent and library)."""
     with STATE_LOCK:
@@ -1235,6 +1265,8 @@ def upload_history_loop():
         try:
             measure = live_joal_upload(include_totals=False)
             rate = measure["bytesPerSecond"]
+            with STATE_LOCK:
+                LIVE_UPLOAD['measure'] = (time.monotonic(), measure)
         except Exception:
             LOG.debug("Débit JOAL illisible", exc_info=True)
             measure, rate = None, None
@@ -3343,8 +3375,27 @@ _GZIP_STATIC = {}
 
 
 def _accepts_gzip(handler):
+    """True when Accept-Encoding allows gzip, quality values included (v1.35: 'gzip;q=0'
+    is a refusal)."""
     headers = getattr(handler, 'headers', None)
-    return headers is not None and 'gzip' in headers.get('Accept-Encoding', '').lower()
+    if headers is None:
+        return False
+    allowed = None
+    for part in headers.get('Accept-Encoding', '').lower().split(','):
+        name, _, params = part.strip().partition(';')
+        quality = 1.0
+        for param in params.split(';'):
+            key, _, value = param.strip().partition('=')
+            if key == 'q':
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        if name.strip() == 'gzip':
+            return quality > 0
+        if name.strip() == '*':
+            allowed = quality > 0
+    return bool(allowed)
 
 
 def _gzip_static(name, data):
@@ -3369,8 +3420,8 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(15)  # Avoid indefinitely blocked HTTP workers.
 
-    def security_headers(self):
-        self.send_header("Cache-Control", "no-store")
+    def security_headers(self, cache="no-store"):
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -3454,16 +3505,26 @@ class Handler(BaseHTTPRequestHandler):
             data = data.replace(b'__JOAL_VERSION__', JOAL_VERSION.encode('ascii'))
             data = interface_design.render(data, 'app' if filename == 'index.html' else 'login',
                                            interface_design.current(DATA))
+            # v1.35: versioned asset URLs, so the browser keeps them until the next update.
+            data = re.sub(rb'((?:src|href)="/assets/[^"?]+\.(?:js|css|svg))"',
+                          lambda m: m.group(1) + b'?v=' + APP_VERSION.encode('ascii') + b'"', data)
         compressed = (content_type.startswith(('text/', 'image/svg')) and len(data) > 2048
                       and _accepts_gzip(self))
         if compressed:
             data = _gzip_static(filename, data)
+        query = parse_qs(urlparse(getattr(self, 'path', '') or '').query)
+        if filename.endswith('.html'):
+            cache = "no-store"
+        elif query.get('v') == [APP_VERSION] or filename.startswith('fonts/'):
+            cache = "private, max-age=31536000, immutable"
+        else:
+            cache = "no-cache"
         self.send_response(200)
         self.send_header('Content-Type', content_type)
         if compressed:
             self.send_header('Content-Encoding', 'gzip')
             self.send_header('Vary', 'Accept-Encoding')
-        self.security_headers()
+        self.security_headers(cache)
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -3647,7 +3708,7 @@ class Handler(BaseHTTPRequestHandler):
                         row['handoff'] = HANDOFF_LEDGER.public_status(row['infoHash'])
             snapshot["simulationModes"] = TORRENT_MODES
             snapshot["simulationsPaused"] = simulations_paused()
-            snapshot["joalUpload"] = live_joal_upload()
+            snapshot["joalUpload"] = shared_joal_upload()
             announce_issue_rows(snapshot)
             upload_hint_rows(snapshot)
             if SWARM_MONITOR is not None:

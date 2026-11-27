@@ -44,9 +44,15 @@ if [ "$(id -u)" = "0" ]; then
   if setpriv --reuid="$PUID" --regid="$PGID" --clear-groups true 2>/dev/null; then
     exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"
   fi
-  echo "AVERTISSEMENT : capacités SETUID/SETGID absentes, exécution en root." >&2
-  echo "AVERTISSEMENT : lancer unraid/update-joal.sh puis Docker > Edit > Apply." >&2
-  exec "$@"
+  # v1.35: no silent fallback to root any more (JOAL and the WebUI would run as root).
+  if [ "${ALLOW_ROOT:-0}" = "1" ]; then
+    echo "AVERTISSEMENT : ALLOW_ROOT=1, exécution en root (déconseillé)." >&2
+    exec "$@"
+  fi
+  echo "ERREUR : capacités SETUID/SETGID absentes, impossible de quitter root : arrêt." >&2
+  echo "Corriger : lancer unraid/update-joal.sh puis Docker > Edit > Apply" >&2
+  echo "(ou ajouter --cap-add=SETUID --cap-add=SETGID). Dépannage seulement : ALLOW_ROOT=1." >&2
+  exit 1
 fi
 
 # Already started with --user: nothing to drop.

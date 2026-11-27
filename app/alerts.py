@@ -127,6 +127,7 @@ class Dispatcher:
         self.queue = queue.Queue(maxsize=50)
         self.last_error = None
         self.thread = None
+        self.thread_lock = threading.Lock()   # v1.35: one worker, started by one caller
 
     def wants(self, config, level):
         return config['enabled'] and config['url'] and (config['level'] == 'all' or level == 'error')
@@ -140,17 +141,26 @@ class Dispatcher:
         except queue.Full:
             self.log.warning('Alertes externes : file pleine, alerte ignorée')
             return False
-        if self.thread is None or not self.thread.is_alive():
-            self.thread = threading.Thread(target=self._run, name='alerts', daemon=True)
-            self.thread.start()
+        self._ensure_worker()
         return True
+
+    def _ensure_worker(self):
+        with self.thread_lock:
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run, name='alerts', daemon=True)
+                self.thread.start()
 
     def _run(self):
         while True:
             try:
                 config, title, message, level = self.queue.get(timeout=60)
             except queue.Empty:
-                return
+                with self.thread_lock:
+                    # An alert queued while this worker was deciding to stop is not left behind.
+                    if self.queue.empty():
+                        self.thread = None
+                        return
+                continue
             try:
                 self.deliver_fn(config, title, message, level)
                 self.last_error = None

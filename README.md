@@ -79,7 +79,7 @@ Le mode local (`update-joal.sh`, image `joal-smart-controller:local`) reste disp
 - **Alertes sur le téléphone** : *Paramètres → Alertes sur le téléphone*. Choisir ntfy (adresse du sujet, jeton facultatif), Gotify (adresse du serveur + jeton d'application) ou Discord (URL du webhook), puis « Envoyer une alerte de test ». « Les problèmes seulement » envoie les incidents ; « Tout » ajoute les rétablissements et les mises à jour installées. Le jeton reste dans `/data/alerts.json` et n'est jamais inclus dans une sauvegarde.
 - **Statistiques** : upload simulé par tracker (aujourd'hui, 7 et 30 jours), temps de seed, nombre de torrents et graphique des 30 derniers jours. Conservé 90 jours dans `/data/tracker-stats.json`.
 - **Nouveautés** : après une mise à jour, une fenêtre résume les changements ; lien « Nouveautés » en pied de page.
-- **Sauvegarde sans passkeys** : décocher « Inclure les fichiers .torrent » avant l'export.
+- **Sauvegarde sans passkeys** : décocher « Inclure les fichiers .torrent » avant l'export (v1.35 : toutes les adresses de tracker y sont réduites au nom du serveur).
 
 ## Discrétion vis-à-vis des trackers (v1.33)
 
@@ -126,6 +126,7 @@ Le mode local (`update-joal.sh`, image `joal-smart-controller:local`) reste disp
 | `ADMIN_PASSWORD` | — | Mot de passe de la WebUI (12 caractères minimum) |
 | `ADMIN_PASSWORD_HASH` | vide | Hash scrypt à la place du mot de passe en clair (prioritaire sur `ADMIN_PASSWORD`) |
 | `DISABLE_TOTP` | `0` | `1` coupe la double authentification (récupération) |
+| `ALLOW_ROOT` | `0` | Dépannage seulement : `1` laisse démarrer en root si le changement d'utilisateur échoue |
 | `QBIT_URL`, `QBIT_USERNAME`, `QBIT_PASSWORD` | vide | Valeurs par défaut de la connexion (modifiables dans la WebUI) |
 | `PUID`, `PGID` | `99`, `100` | Utilisateur d'exécution (Unraid `nobody:users`) |
 | `TORRENT_FILE_MODE`, `TORRENT_DIR_MODE` | `0660`, `0770` | Permissions de `/data/torrents` |

@@ -96,28 +96,13 @@ class SwarmMonitor:
                     continue
                 del self.entries[h]
                 modified = True
+            wanted = []
             for h, t in incoming.items():
                 old = self.entries.get(h)
                 if old is not None and old.get('mode') == 'solo':
                     continue  # The standalone library owns this metadata
                 if old is None or not old.get('urls') or self.now() - float(old.get('urlsRefreshedAt', 0) or 0) >= 3600:
-                    try:
-                        raw = trackers_for_hash(h)
-                        urls = sorted({tr.get('url') for tr in raw if isinstance(tr, dict) and
-                                       isinstance(tr.get('url'), str) and domain(tr['url'])})[:8]
-                    except (OSError, ValueError, RuntimeError):
-                        # A transient qBittorrent tracker query failure should not
-                        # prevent storing other records during this refresh.
-                        continue
-                    self.entries[h] = {'name': str(t.get('name', '(sans nom)'))[:160],
-                                       'urls': urls, 'observations': old.get('observations', {}) if old else {},
-                                       'history': old.get('history', {}) if old else {},
-                                       'trackerHistory': old.get('trackerHistory', {}) if old else {},
-                                       'lastPeers': old.get('lastPeers', {}) if old else {},
-                                       'peerLog': old.get('peerLog', []) if old else [],
-                                       'addedAt': old.get('addedAt', self.now()) if old else self.now(),
-                                       'seenQbitAt': self.now(), 'urlsRefreshedAt': self.now()}
-                    modified = True
+                    wanted.append(h)
                 else:
                     name = str(t.get('name', '(sans nom)'))[:160]
                     if old.get('name') != name:
@@ -126,6 +111,33 @@ class SwarmMonitor:
                     # Keep previous tracker URLs until explicit torrent/tag removal;
                     # no need to re-query qBittorrent to perform later scrapes.
                     old['seenQbitAt'] = self.now()
+        # v1.35: qBittorrent is asked outside the lock, so a slow qBittorrent no longer
+        # blocks the readings, the dashboard or the JOAL sessions waiting for this lock.
+        fetched = {}
+        for h in wanted:
+            try:
+                raw = trackers_for_hash(h)
+                fetched[h] = sorted({tr.get('url') for tr in raw if isinstance(tr, dict) and
+                                     isinstance(tr.get('url'), str) and domain(tr['url'])})[:8]
+            except (OSError, ValueError, RuntimeError):
+                # A transient qBittorrent tracker query failure should not
+                # prevent storing other records during this refresh.
+                continue
+        with self.lock:
+            for h, urls in fetched.items():
+                t = incoming[h]
+                old = self.entries.get(h)
+                if old is not None and old.get('mode') == 'solo':
+                    continue      # imported meanwhile
+                self.entries[h] = {'name': str(t.get('name', '(sans nom)'))[:160],
+                                   'urls': urls, 'observations': old.get('observations', {}) if old else {},
+                                   'history': old.get('history', {}) if old else {},
+                                   'trackerHistory': old.get('trackerHistory', {}) if old else {},
+                                   'lastPeers': old.get('lastPeers', {}) if old else {},
+                                   'peerLog': old.get('peerLog', []) if old else [],
+                                   'addedAt': old.get('addedAt', self.now()) if old else self.now(),
+                                   'seenQbitAt': self.now(), 'urlsRefreshedAt': self.now()}
+                modified = True
         if modified:
             self.save()
         return modified

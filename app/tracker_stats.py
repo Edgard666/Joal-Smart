@@ -65,10 +65,17 @@ class TrackerStats:
                                                  for domain, v in domains.items()}
                                            for day, domains in self.days.items()}}
             self.dirty = False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_name(self.path.name + '.tmp')
-        temp.write_text(json.dumps(data, separators=(',', ':')), encoding='utf-8')
-        os.replace(temp, self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(self.path.name + '.tmp')
+            temp.write_text(json.dumps(data, separators=(',', ':')), encoding='utf-8')
+            os.replace(temp, self.path)
+        except BaseException:
+            # v1.35: a failed write (disk full...) is retried at the next flush, even when
+            # no new measure arrives in between.
+            with self.lock:
+                self.dirty = True
+            raise
 
     def summary(self, days=30, today=None):
         """Per-tracker totals for today / 7 / 30 days and a daily series, plus overall totals."""

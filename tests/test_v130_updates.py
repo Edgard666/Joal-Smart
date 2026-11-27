@@ -64,7 +64,7 @@ class JoalVersionShown(unittest.TestCase):
                 self.wfile = io.BytesIO()
             def send_response(self, *_): pass
             def send_header(self, *_): pass
-            def security_headers(self): pass
+            def security_headers(self, *_): pass
             def end_headers(self): pass
         page = Page()
         with tempfile.TemporaryDirectory() as tmp, patch.object(main, 'DATA', Path(tmp)), \

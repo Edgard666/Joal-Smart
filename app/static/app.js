@@ -1878,7 +1878,11 @@
     solo.items = [...items.values()];
     renderStatus();
   }
+  let stateInFlight = false, stateAgain = false;
   async function fetchStatus() {
+    // v1.35: one /api/state request at a time; a slow answer is not stacked every 5 s.
+    if (stateInFlight) { stateAgain = true; return; }
+    stateInFlight = true;
     const request = ++stateRequest;
     try {
       const snapshot = await api('/api/state');
@@ -1895,6 +1899,11 @@
       }
       $('alert').textContent = 'Impossible de lire l’état : ' + error.message;
       $('alert').classList.remove('hidden');
+    }
+    finally {
+      stateInFlight = false;
+      // A refresh asked for during the request (after an action) is done right after it.
+      if (stateAgain) { stateAgain = false; fetchStatus(); }
     }
   }
   async function fetchConfig() {
@@ -2164,7 +2173,7 @@
   // Interface design: saved server-side, applied at once by swapping the stylesheet.
   function applyDesign(design, stylesheet) {
     const link = document.querySelector('link[rel="stylesheet"]');
-    if (link && stylesheet && link.getAttribute('href') !== stylesheet) link.setAttribute('href', stylesheet);
+    if (link && stylesheet && link.getAttribute('href').split('?')[0] !== stylesheet) link.setAttribute('href', stylesheet);
     document.documentElement.dataset.design = design;
     document.querySelector('meta[name="color-scheme"]')?.setAttribute('content', design === 'baie' ? 'light' : 'dark');
   }

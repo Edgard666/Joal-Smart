@@ -1,5 +1,25 @@
 # Journal des versions
 
+## v1.35.0 · Correctifs issus d'un audit externe
+
+**Sécurité**
+- **Sauvegarde « sans .torrent » réellement sans passkeys** : elle contenait encore `tracker-registry.json` avec les adresses complètes des trackers. Toutes les adresses de tracker des fichiers sauvegardés ne gardent plus que le nom du serveur ; les listes d'adresses sont relues ensuite depuis qBittorrent ou les `.torrent` importés. Un test vérifie qu'aucune passkey ne reste dans l'archive.
+- **Plus de démarrage en root** si le conteneur ne peut pas changer d'utilisateur : il s'arrête avec un message qui explique la correction (`ALLOW_ROOT=1` pour un dépannage seulement).
+- Fichiers `.torrent` importés créés directement en accès privé, même un instant.
+
+**Fiabilité**
+- **Restauration exacte** : les réglages absents de la sauvegarde sont supprimés, et les torrents importés aussi quand la sauvegarde les contient tous (un manifeste l'indique). Une sauvegarde sans `.torrent`, ou faite avant la v1.35, ne supprime aucun torrent. Le point de restauration automatique reste créé avant.
+- La liste des trackers est demandée à qBittorrent sans bloquer les relevés ni l'interface (un qBittorrent lent pouvait tout figer jusqu'à 20 s).
+- Statistiques : une écriture ratée (disque plein) est retentée, même sans nouvelle mesure.
+- Configuration : plus de message d'erreur quand elle est bien enregistrée mais que les droits ne peuvent pas être changés (ACL Unraid).
+- Alertes externes : un seul envoi à la fois, aucune alerte oubliée en file.
+
+**Performances**
+- Le débit de JOAL est lu une seule fois par seconde et partagé par l'interface et le widget (avant : relu à chaque requête, base de données comprise).
+- Une seule demande d'état à la fois depuis l'interface.
+- Scripts et feuilles de style gardés en cache par le navigateur jusqu'à la mise à jour suivante (adresses versionnées).
+- La compression respecte le refus du navigateur (`gzip;q=0`).
+
 ## v1.34.1 · Build GitHub corrigé
 
 - **Correction d'un test** : depuis la double authentification (v1.32), la page de connexion lit la réponse du serveur avant d'afficher « Identifiants incorrects ». Le test navigateur de connexion vérifiait le message immédiatement et échouait sur le serveur GitHub, plus rapide ou plus lent selon les jours. Il attend maintenant que le message apparaisse. L'application n'a pas changé.

@@ -105,8 +105,9 @@ class DesignHttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(data)['stylesheet'], '/assets/design-baie.css')
         page = self.request('/', headers={'Cookie': cookie})[1]
-        self.assertIn(b'href="/assets/design-baie.css"', page)
-        self.assertIn(b'href="/assets/design-baie-login.css"', self.request('/login')[1])
+        # v1.35: served with ?v=<version> (browser cache until the next update).
+        self.assertIn(f'href="/assets/design-baie.css?v={main.APP_VERSION}"'.encode(), page)
+        self.assertIn(f'href="/assets/design-baie-login.css?v={main.APP_VERSION}"'.encode(), self.request('/login')[1])
 
     def test_public_assets_of_the_login_page(self):
         code, data, headers = self.request('/assets/design-baie-login.css')

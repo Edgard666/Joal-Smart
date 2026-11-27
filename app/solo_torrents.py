@@ -180,7 +180,7 @@ class SoloLibrary:
             stored_name = self._unique_name(name, h)
             target = self.root / stored_name
             try:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # v1.35: never readable by others, even briefly
             except FileExistsError as exc:
                 raise ImportErrorValue('Conflit de nom lors de l’enregistrement du torrent') from exc
             try:

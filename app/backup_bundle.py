@@ -32,8 +32,25 @@ CLIENT = re.compile(r'^clients/[a-zA-Z0-9_.-]{1,100}\.client$')
 TORRENT_HASH = re.compile(r'^[0-9a-f]{40}$')
 
 
+MANIFEST = 'backup-manifest.json'
+_URL = re.compile(r'\b((?:https?|udp)://)([^/\s?#"\'<>]+)[^\s"\'<>]*', re.IGNORECASE)
+
+
+def anonymize(value):
+    """Settings without secrets (v1.35): every tracker URL keeps its host only, so no
+    passkey (in the path or the query) leaves /data. Lists of URLs become empty: the
+    controller reads them again from qBittorrent or the imported .torrent files."""
+    if isinstance(value, dict):
+        return {k: ([] if k == 'urls' and isinstance(v, list) else anonymize(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [anonymize(v) for v in value]
+    if isinstance(value, str) and '://' in value:
+        return _URL.sub(lambda m: m.group(1) + m.group(2).rsplit('@', 1)[-1] + '/', value)
+    return value
+
+
 def permitted(name):
-    if name in PERSISTENT_JSON or CLIENT.fullmatch(name):
+    if name in PERSISTENT_JSON or name == MANIFEST or CLIENT.fullmatch(name):
         return True
     if not isinstance(name, str) or not name.startswith('torrents/'):
         return False
@@ -85,12 +102,20 @@ def build_backup(root, include_torrents=True):
     total = 0
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.writestr(MANIFEST, json.dumps({'version': 1, 'torrents': bool(include_torrents)}))
         for name, path in files:
             size = path.stat().st_size
             if size > (MAX_TORRENT_BYTES if name.startswith('torrents/') else MAX_ENTRY) or total + size > MAX_TOTAL:
                 raise ValueError('La taille des données persistantes dépasse la limite de sauvegarde')
             total += size
-            zf.write(path, arcname=name)
+            if not include_torrents and name.endswith('.json'):
+                try:
+                    data = json.loads(path.read_text(encoding='utf-8'))
+                except (OSError, ValueError, UnicodeError):
+                    continue        # unreadable: left out rather than copied with its secrets
+                zf.writestr(name, json.dumps(anonymize(data), ensure_ascii=False, separators=(',', ':')))
+            else:
+                zf.write(path, arcname=name)
     blob = output.getvalue()
     if len(blob) > MAX_ARCHIVE:
         raise ValueError('Archive trop volumineuse')
@@ -146,6 +171,8 @@ def inspect_backup(blob):
                         raise ValueError('Design d’interface invalide dans la sauvegarde')
                     if name == 'policy.json':
                         validate(parsed)
+                    if name == MANIFEST and not isinstance(parsed.get('torrents'), bool):
+                        raise ValueError('Manifeste de sauvegarde invalide')
                 result[name] = data
         if 'policy.json' not in result:
             raise ValueError('policy.json est obligatoire dans la sauvegarde')
@@ -172,7 +199,7 @@ def schedule_restore(root, blob):
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    return len(files)
+    return len([name for name in files if name != MANIFEST])
 
 
 def apply_pending_restore(root):
@@ -210,15 +237,29 @@ def apply_pending_restore(root):
         stream.write(previous_backup)
         stream.flush()
         os.fsync(stream.fileno())
+    manifest = json.loads(restored.pop(MANIFEST).decode('utf-8')) if MANIFEST in restored else None
+    # v1.35: exact restore. Settings files missing from the archive are removed, and so are
+    # imported torrents when the archive holds them all. Archives from before v1.35 (no
+    # manifest) and archives made without .torrent files keep the files in place.
+    obsolete = [name for name, _ in list_files(root)
+                if name not in restored and not name.startswith('clients/')
+                and (name in PERSISTENT_JSON or (manifest and manifest['torrents'] and name.startswith('torrents/')))]
+    if manifest is None:
+        obsolete = []
     originals = {}
     updated = []
     try:
+        for name in obsolete:
+            target = root / name
+            originals[name] = target.read_bytes()
+            target.unlink()
+            updated.append(name)
         for name, content in restored.items():
             target = root / name
             if target.is_symlink() or target.parent.is_symlink():
                 raise ValueError('Lien symbolique présent dans le dossier de restauration')
             target.parent.mkdir(parents=True, exist_ok=True)
-            originals[name] = target.read_bytes() if target.exists() else None
+            originals.setdefault(name, target.read_bytes() if target.exists() else None)
             temp = target.with_name(target.name + '.restore-tmp')
             with open(temp, 'xb') as f:
                 os.chmod(temp, 0o600)
@@ -234,6 +275,7 @@ def apply_pending_restore(root):
             if original is None:
                 target.unlink(missing_ok=True)
             else:
+                target.parent.mkdir(parents=True, exist_ok=True)
                 temp = target.with_name(target.name + '.rollback-tmp')
                 temp.write_bytes(original)
                 os.chmod(temp, 0o600)
